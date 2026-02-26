@@ -102,11 +102,16 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import Expr, MemorySpace
 
-from ..typing import Scalar, Tensor, Tile
+from ..typing import IntLike, Scalar, Tensor, Tile
+
+
+def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
+    """Unwrap Scalar elements to Expr so the sequence matches C++ binding types."""
+    return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
 
 
 def create_tile(
-    shape: list[int],
+    shape: Sequence[IntLike],
     dtype: DataType,
     target_memory: MemorySpace = MemorySpace.Vec,
 ) -> Tile:
@@ -120,14 +125,20 @@ def create_tile(
     Returns:
         Tile wrapping the create_tile operation
     """
-    call_expr = _ir_ops.create_tile(shape, dtype, target_memory)
+    # create_tile C++ binding accepts Sequence[int]; Expr elements from Scalar
+    # unwrapping are valid at DSL parse time (parser reads the AST).
+    call_expr = _ir_ops.create_tile(
+        _normalize_intlike(shape),  # type: ignore[reportArgumentType]
+        dtype,
+        target_memory,
+    )
     return Tile(expr=call_expr)
 
 
 def load(
     tensor: Tensor,
-    offsets: Sequence[int | Expr],
-    shapes: Sequence[int | Expr],
+    offsets: Sequence[IntLike],
+    shapes: Sequence[IntLike],
     target_memory: MemorySpace = MemorySpace.Vec,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
@@ -147,14 +158,16 @@ def load(
         >>> # 3D load
         >>> tile = load(tensor, offsets=[0, 0, 0], shapes=[8, 16, 32])
     """
-    call_expr = _ir_ops.load(tensor.unwrap(), offsets, shapes, target_memory)
+    call_expr = _ir_ops.load(
+        tensor.unwrap(), _normalize_intlike(offsets), _normalize_intlike(shapes), target_memory
+    )
     return Tile(expr=call_expr)
 
 
 def store(
     tile: Tile,
-    offsets: Sequence[int | Expr],
-    shapes: Sequence[int | Expr],
+    offsets: Sequence[IntLike],
+    shapes: Sequence[IntLike],
     output_tensor: Tensor,
 ) -> Tensor:
     """Copy data from tile back to tensor.
@@ -174,14 +187,16 @@ def store(
         >>> # 3D store
         >>> result = store(tile, offsets=[0, 0, 0], shapes=[8, 16, 32], output_tensor=tensor)
     """
-    call_expr = _ir_ops.store(tile.unwrap(), offsets, shapes, output_tensor.unwrap())
+    call_expr = _ir_ops.store(
+        tile.unwrap(), _normalize_intlike(offsets), _normalize_intlike(shapes), output_tensor.unwrap()
+    )
     return Tensor(expr=call_expr)
 
 
 def l0c_store(
     tile: Tile,
-    offsets: list[int | Expr] | tuple[int | Expr, ...],
-    shapes: list[int | Expr] | tuple[int | Expr, ...],
+    offsets: Sequence[IntLike],
+    shapes: Sequence[IntLike],
     output_tensor: Tensor,
 ) -> Tensor:
     """Copy data from Acc tile to GM tensor.
@@ -201,7 +216,9 @@ def l0c_store(
         >>> # 3D l0c_store
         >>> result = l0c_store(tile, offsets=[0, 0, 0], shapes=[8, 16, 32], output_tensor=tensor)
     """
-    call_expr = _ir_ops.l0c_store(tile.unwrap(), offsets, shapes, output_tensor.unwrap())
+    call_expr = _ir_ops.l0c_store(
+        tile.unwrap(), _normalize_intlike(offsets), _normalize_intlike(shapes), output_tensor.unwrap()
+    )
     return Tensor(expr=call_expr)
 
 
@@ -508,7 +525,7 @@ def cast(
     tile: Tile,
     target_type: int | DataType,
     mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
-):
+) -> Tile:
     """Cast tile to target data type (element-wise).
 
     Args:
@@ -931,7 +948,7 @@ def min(tile: Tile | Scalar, axis: int | Scalar = 0, keepdim: bool = False) -> T
     return Tile(expr=call_expr)
 
 
-def view(tile: Tile, shape: list[int | Expr], offset: list[int | Expr]) -> Tile:
+def view(tile: Tile, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tile:
     """Create a view/slice of a tile with new shape and offset.
 
     Args:
@@ -943,11 +960,11 @@ def view(tile: Tile, shape: list[int | Expr], offset: list[int | Expr]) -> Tile:
         Tile wrapping the view operation
     """
     tile_expr = tile.unwrap()
-    call_expr = _ir_ops.view(tile_expr, shape, offset)
+    call_expr = _ir_ops.view(tile_expr, _normalize_intlike(shape), _normalize_intlike(offset))
     return Tile(expr=call_expr)
 
 
-def reshape(tile: Tile, shape: list[int | Expr]) -> Tile:
+def reshape(tile: Tile, shape: Sequence[IntLike]) -> Tile:
     """Reshape tile to new shape.
 
     Args:
@@ -958,7 +975,7 @@ def reshape(tile: Tile, shape: list[int | Expr]) -> Tile:
         Tile wrapping the reshape operation
     """
     tile_expr = tile.unwrap()
-    call_expr = _ir_ops.reshape(tile_expr, shape)
+    call_expr = _ir_ops.reshape(tile_expr, _normalize_intlike(shape))
     return Tile(expr=call_expr)
 
 
