@@ -30,6 +30,8 @@
 
 ### When to Add Tests
 
+**Prefer adding to existing test files** when a related test file already exists. Only create a new test file when no existing file covers the topic. **Exception**: IR statement node tests should each have a dedicated file (e.g., `test_for_stmt.py`) for discoverability.
+
 **Add tests for:**
 
 - New features requiring validation
@@ -68,6 +70,12 @@
 - Use pytest fixtures for setup/teardown, not `setUp()`/`tearDown()` methods
 - Use `pytest.raises()` for exception testing, not `self.assertRaises()`
 - **Always use `assert` to verify results, never `print`.** Tests must fail on wrong output, not just display it.
+- **Every test file must end with a `pytest.main` block:**
+
+```python
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
 
 ```python
 # ✅ Good - pytest style with assert

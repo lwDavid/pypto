@@ -85,7 +85,9 @@ The verifier integrates into Pass pipelines via `run_verifier()`:
 | **NormalizedStmtStructure** | NormalizedStmtStructure | Bodies are SeqStmts, consecutive assigns wrapped in OpStmts |
 | **FlattenedSingleStmt** | FlattenedSingleStmt | No single-element SeqStmts/OpStmts |
 | **SplitIncoreOrch** | SplitIncoreOrch | No InCore ScopeStmts remain in Opaque functions |
+| **IncoreBlockOps** | IncoreBlockOps | InCore functions use block ops (no tensor-level ops remain) |
 | **HasMemRefs** | HasMemRefs | All TileType variables have MemRef initialized |
+| **AllocatedMemoryAddr** | AllocatedMemoryAddr | All MemRefs have valid addresses within buffer limits |
 
 ### SSAVerify
 
@@ -155,7 +157,7 @@ Singleton registry mapping `IRProperty` values to `PropertyVerifier` factories. 
 | `HasVerifier(prop)` | Check if a verifier is registered |
 | `VerifyProperties(properties, program)` | Verify a set of properties, return diagnostics |
 
-All 7 built-in properties are pre-registered in the constructor.
+All 9 built-in properties are pre-registered in the constructor.
 
 ## C++ API Reference
 
