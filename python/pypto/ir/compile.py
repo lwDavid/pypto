@@ -83,16 +83,30 @@ def compile(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Use PassContext only when user explicitly overrides verification level.
-    # When None, let C++ PassPipeline fall through to env-var default (PYPTO_VERIFY_LEVEL).
-    from contextlib import nullcontext  # noqa: PLC0415
-
     if verification_level is not None and _passes.PassContext.current() is not None:
         raise RuntimeError(
             "compile() was called with verification_level while a PassContext is already active. "
             "Set the verification level on the existing PassContext instead."
         )
-    ctx = _passes.PassContext([], verification_level) if verification_level is not None else nullcontext()
+
+    # ReportInstrument: generate memory usage report after AllocateMemoryAddr
+    report_dir = os.path.join(output_dir, "report")
+    os.makedirs(report_dir, exist_ok=True)
+    report_instrument = _passes.ReportInstrument(report_dir)
+    report_instrument.enable_report(_passes.ReportType.Memory, "AllocateMemoryAddr")
+
+    instruments: list[_passes.PassInstrument] = [report_instrument]
+    outer = _passes.PassContext.current()
+    if verification_level is not None:
+        ctx = _passes.PassContext(instruments, verification_level)
+    elif outer is None:
+        ctx = _passes.PassContext(instruments, _passes.get_default_verification_level())
+    else:
+        ctx = _passes.PassContext(
+            list(outer.get_instruments()) + instruments,
+            outer.get_verification_level(),
+        )
+
     with ctx:
         pm = PassManager.get_strategy(strategy)
         passes_dump_dir = os.path.join(output_dir, "passes_dump")
