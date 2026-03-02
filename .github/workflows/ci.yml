@@ -85,6 +85,8 @@ jobs:
     runs-on: [self-hosted, linux, arm64, npu]
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
+      SIMPLER_ROOT: ${{ github.workspace }}/simpler
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
     container:
       image: localhost:5000/ci-device-py310:latest
       options: >-
@@ -127,9 +129,6 @@ jobs:
       - name: Test system tests (first attempt)
         id: test_first_attempt
         continue-on-error: true
-        env:
-          SIMPLER_ROOT: ${{ github.workspace }}/simpler
-          PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
         run: pytest tests/st -v --device=$DEVICE_ID --forked
 
       - name: Checkout stable simpler commit on failure
@@ -140,11 +139,32 @@ jobs:
       - name: Test system tests (retry with stable version)
         id: test_retry
         if: steps.test_first_attempt.outcome == 'failure'
-        env:
-          SIMPLER_ROOT: ${{ github.workspace }}/simpler
-          PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
         run: pytest tests/st -v --device=$DEVICE_ID --forked
 
       - name: Check final test result
         if: steps.test_first_attempt.outcome == 'failure' && steps.test_retry.outcome == 'failure'
         run: exit 1
+
+      # --- Fuzz testing ---
+      - name: Run fuzz tests (device)
+        run: |
+          rm -rf build/fuzz-artifacts && mkdir -p build/fuzz-artifacts/hw
+          python tests/st/fuzz/example_mutil_kernel.py --num-cases 10
+          pytest tests/st/fuzz/generated/test_fuzz_multi_kernel.py \
+            -v -s --save-kernels --dump-passes \
+            --kernels-dir=build/fuzz-artifacts/hw \
+            --device=$DEVICE_ID --forked --platform=a2a3 \
+            --junitxml=fuzz-results-hw.xml || true
+          python tests/st/fuzz/check_pass_rate.py \
+            fuzz-results-hw.xml \
+            --threshold 0.7
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: |
+            fuzz-results-hw.xml
+            build/fuzz-artifacts/
+          retention-days: 7

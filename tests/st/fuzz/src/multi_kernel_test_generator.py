@@ -17,12 +17,14 @@ This module is responsible for generating:
 - PTOTestCase test class
 """
 
+import random
 from typing import Any
 
 import numpy as np
 import torch
 
 from .fuzzer import OpFuzzer
+from .golden_generator import generate_kernel_torch_ref
 from .kernel_generator import KernelGenerator
 from .orchestrator_generator import OrchestratorGenerator
 
@@ -37,6 +39,10 @@ class MultiKernelTestGenerator:
         advanced_ops_probability: float = 0.5,
         tensor_init_type: str = "constant",
         validate_golden: bool = True,
+        enable_for_loop: bool = False,
+        max_for_loop_iterations: int = 4,
+        enable_if_else: bool = False,
+        for_loop_probability: float = 1.0,
     ):
         """Initialize test generator
 
@@ -46,6 +52,12 @@ class MultiKernelTestGenerator:
             advanced_ops_probability: Probability of selecting advanced ops (default: 0.5)
             tensor_init_type: Tensor initialization type (constant, random, range, normal)
             validate_golden: Validate golden output (check for NaN/Inf)
+            enable_for_loop: Wrap kernel body in a for loop (scf.for)
+            max_for_loop_iterations: Upper bound for random iteration count
+            enable_if_else: Generate if/else branching in kernel (scf.if)
+            for_loop_probability: Probability that a kernel batch uses a for loop when
+                enable_for_loop=True. Defaults to 1.0 (always). Set below 1.0 to mix
+                loop and no-loop test cases.
         """
         self.seed = seed
         self.enable_advanced_ops = enable_advanced_ops
@@ -56,7 +68,12 @@ class MultiKernelTestGenerator:
             seed=seed,
             enable_advanced_ops=enable_advanced_ops,
             advanced_ops_probability=advanced_ops_probability,
+            enable_for_loop=enable_for_loop,
+            max_for_loop_iterations=max_for_loop_iterations,
+            enable_if_else=enable_if_else,
+            for_loop_probability=for_loop_probability,
         )
+        self.rng = random.Random(seed)
         self.orch_gen = OrchestratorGenerator(seed=seed)
         self.fuzzer = OpFuzzer(
             seed=seed,
@@ -189,14 +206,27 @@ class MultiKernelTestGenerator:
         """Regenerate kernel code with unified input shapes
 
         Args:
-            kernel: Kernel information
-            input_shapes_map: Mapping from input names to unified shapes
+            kernel: Kernel information (with full tensor shapes in metadata)
+            input_shapes_map: Mapping from input names to unified full tensor shapes
 
         Returns:
             Regenerated kernel code
         """
-        # Update kernel inputs with unified shapes
-        unified_inputs = [(inp_name, input_shapes_map[inp_name]) for inp_name, _ in kernel["inputs"]]
+        loop_info = kernel.get("for_loop_info", {"iterations": 0, "tiling": False, "split_point": 0})
+        iterations = loop_info["iterations"]
+        use_tiling = loop_info["tiling"]
+        split_point = loop_info["split_point"]
+        tile_output_shape = kernel.get("tile_shape", kernel["output_shape"])
+
+        # Build unified inputs using full tensor shapes from the map
+        unified_full_inputs = [(inp_name, input_shapes_map[inp_name]) for inp_name, _ in kernel["inputs"]]
+
+        # Convert full tensor shapes back to tile shapes for code generation
+        # Only tiling mode scales shapes; accumulation mode uses tile-sized tensors directly
+        if iterations > 0 and use_tiling:
+            unified_tile_inputs = [(name, (r // iterations, c)) for name, (r, c) in unified_full_inputs]
+        else:
+            unified_tile_inputs = unified_full_inputs
 
         # Get scalars from kernel
         scalars = kernel.get("scalars", [])
@@ -206,15 +236,20 @@ class MultiKernelTestGenerator:
         for param_name, value in scalars:
             scalar_value_to_param[value] = param_name
 
-        # Reuse the kernel generator's code generation logic
-        return self.kernel_gen._generate_kernel_code(
+        # Reuse the kernel generator's code generation logic with saved loop config
+        code, _ = self.kernel_gen._generate_kernel_code(
             kernel_name=kernel["name"],
-            inputs=unified_inputs,
+            inputs=unified_tile_inputs,
             scalars=scalars,
             op_chain=kernel["op_chain"],
-            output_shape=kernel["output_shape"],
+            output_shape=tile_output_shape,
             scalar_value_to_param=scalar_value_to_param,
+            for_loop_iterations=iterations,
+            for_loop_tiling=use_tiling,
+            for_loop_split_point=split_point,
+            if_else_info=kernel.get("if_else_info"),
         )
+        return code
 
     def generate_test_case(
         self,
@@ -308,101 +343,9 @@ class MultiKernelTestGenerator:
             Torch reference implementation code string
         """
         code_lines = []
-
-        # Generate per-kernel Torch reference functions
         for kernel in kernels:
-            kernel_name = kernel["name"]
-            input_names = [inp[0] for inp in kernel["inputs"]]
-            op_chain = kernel["op_chain"]
-
-            # Standalone function (no self parameter)
-            code_lines.append(f"    def _torch_{kernel_name}({', '.join(input_names)}):")
-            code_lines.append(f'        """Torch reference implementation for {kernel_name}"""')
-
-            code_lines.append("        env = {}")
-            for name in input_names:
-                code_lines.append(f"        env['tile_{name}'] = {name}.clone()")
-
-            code_lines.append("")
-            for op_dict in op_chain:
-                op = op_dict["op"]
-                inputs = op_dict["inputs"]
-                output = op_dict["output"]
-
-                input_vals = []
-                for inp in inputs:
-                    if inp.startswith("tile_") or inp.startswith("tmp_"):
-                        input_vals.append(f"env['{inp}']")
-                    else:
-                        input_vals.append(inp)
-
-                if op.np_equivalent:
-                    torch_expr = self._get_torch_operation(op.name, input_vals)
-                    code_lines.append(f"        env['{output}'] = {torch_expr}")
-
-            code_lines.append(f"        return env['{op_chain[-1]['output']}']")
-            code_lines.append("")
-
+            code_lines.extend(generate_kernel_torch_ref(kernel))
         return "\n".join(code_lines)
-
-    # Operation mapping: PyPTO op name -> torch expression template or callable
-    _TORCH_OP_MAP = {
-        # Binary arithmetic operations
-        "block.add": lambda v: f"{v[0]} + {v[1]}",
-        "block.sub": lambda v: f"{v[0]} - {v[1]}",
-        "block.mul": lambda v: f"{v[0]} * {v[1]}",
-        "block.div": lambda v: f"{v[0]} / {v[1]}",
-        "block.adds": lambda v: f"{v[0]} + {v[1]}",
-        "block.subs": lambda v: f"{v[0]} - {v[1]}",
-        "block.muls": lambda v: f"{v[0]} * {v[1]}",
-        "block.divs": lambda v: f"{v[0]} / {v[1]}",
-        # Binary comparison operations
-        "block.maximum": lambda v: f"torch.maximum({v[0]}, {v[1]})",
-        "block.minimum": lambda v: f"torch.minimum({v[0]}, {v[1]})",
-        # Unary operations
-        "block.sqrt": lambda v: f"torch.sqrt({v[0]})",
-        "block.rsqrt": lambda v: f"torch.rsqrt({v[0]})",
-        "block.exp": lambda v: f"torch.exp(torch.clamp({v[0]}, -10, 10))",
-        "block.neg": lambda v: f"-{v[0]}",
-        "block.recip": lambda v: f"torch.reciprocal({v[0]})",
-        "block.log": lambda v: f"torch.log({v[0]})",
-        "block.abs": lambda v: f"torch.abs({v[0]})",
-        "block.relu": lambda v: f"torch.relu({v[0]})",
-        # Row expand operations (broadcasting)
-        "block.row_expand_add": lambda v: f"{v[0]} + {v[1]}",
-        "block.row_expand_sub": lambda v: f"{v[0]} - {v[1]}",
-        "block.row_expand_mul": lambda v: f"{v[0]} * {v[1]}",
-        "block.row_expand_div": lambda v: f"{v[0]} / {v[1]}",
-        # Row reduction operations (produce [M, 1] output)
-        "block.row_sum": lambda v: f"torch.sum({v[0]}, dim=1, keepdim=True)",
-        "block.row_max": lambda v: f"torch.max({v[0]}, dim=1, keepdim=True)[0]",
-        "block.row_min": lambda v: f"torch.min({v[0]}, dim=1, keepdim=True)[0]",
-        # Column expand operations (broadcast [1, N] to [M, N])
-        "block.col_expand_mul": lambda v: f"{v[0]} * {v[1]}",
-        "block.col_expand_div": lambda v: f"{v[0]} / {v[1]}",
-        "block.col_expand_sub": lambda v: f"{v[0]} - {v[1]}",
-        # Column reduction operations (produce [1, N] output)
-        "block.col_sum": lambda v: f"torch.sum({v[0]}, dim=0, keepdim=True)",
-        "block.col_max": lambda v: f"torch.max({v[0]}, dim=0, keepdim=True)[0]",
-        "block.col_min": lambda v: f"torch.min({v[0]}, dim=0, keepdim=True)[0]",
-        # Matrix operations
-        "block.matmul": lambda v: f"torch.matmul({v[0]}, {v[1]})",
-    }
-
-    def _get_torch_operation(self, op_name: str, input_vals: list[str]) -> str:
-        """Convert PyPTO operation to Torch expression.
-
-        Args:
-            op_name: PyPTO operation name (e.g., "block.add")
-            input_vals: Input value expressions
-
-        Returns:
-            Torch expression string
-        """
-        op_func = self._TORCH_OP_MAP.get(op_name)
-        if op_func:
-            return op_func(input_vals)
-        return f"# Unsupported operation: {op_name}"
 
     def _generate_test_class(  # noqa: PLR0912, PLR0915
         self,
@@ -487,6 +430,16 @@ class MultiKernelTestGenerator:
             f"            TensorSpec('output', [{output_shape[0]}, {output_shape[1]}], "
             f"DataType.FP32, is_output=True),"
         )
+
+        # Add config tensor for if/else kernels
+        needs_config = orch_info.get("needs_config", False)
+        if needs_config:
+            branch_cond_val = self.rng.randint(0, 1)
+            code_lines.append(
+                "            TensorSpec('config', [1], DataType.INT64, "
+                f"init_value=torch.tensor([{branch_cond_val}], dtype=torch.int64)),"
+            )
+
         code_lines.append("        ]")
         code_lines.append("")
 
@@ -544,6 +497,11 @@ class MultiKernelTestGenerator:
                 code_lines.append(line)
         code_lines.append("")
 
+        # Extract branch_cond from config tensor for if/else kernels
+        if needs_config:
+            code_lines.append("        branch_cond = bool(int(torch_tensors['config'][0]))")
+            code_lines.append("")
+
         if orch_info["mode"] == "sequential":
             result_var = None
             for i, kernel in enumerate(kernels):
@@ -558,6 +516,10 @@ class MultiKernelTestGenerator:
                     inputs_str = ", ".join(inputs_parts)
                 else:
                     inputs_str = ", ".join([f"torch_tensors['{inp}']" for inp in kernel_inputs])
+
+                # Append branch_cond for if/else kernels
+                if kernel.get("has_config_scalar", False):
+                    inputs_str += ", branch_cond"
 
                 result_var = f"result_{i}"
                 code_lines.append(f"        {result_var} = _torch_{kernel_name}({inputs_str})")
@@ -576,6 +538,8 @@ class MultiKernelTestGenerator:
                 branch_results.append(result_var)
 
                 inputs_str = ", ".join([f"torch_tensors['{inp}']" for inp in kernel_inputs])
+                if kernel.get("has_config_scalar", False):
+                    inputs_str += ", branch_cond"
                 code_lines.append(f"        {result_var} = _torch_{kernel_name}({inputs_str})")
 
             if len(branch_results) == 1:
@@ -607,6 +571,8 @@ class MultiKernelTestGenerator:
                 branch_results.append(result_var)
 
                 inputs_str = ", ".join([f"torch_tensors['{inp}']" for inp in kernel_inputs])
+                if kernel.get("has_config_scalar", False):
+                    inputs_str += ", branch_cond"
                 code_lines.append(f"        {result_var} = _torch_{kernel_name}({inputs_str})")
 
             if len(branch_results) > 1:
@@ -629,6 +595,8 @@ class MultiKernelTestGenerator:
                 for inp in kernel_inputs[1:]:
                     inputs_parts.append(f"torch_tensors['{inp}']")
                 inputs_str = ", ".join(inputs_parts)
+                if kernel.get("has_config_scalar", False):
+                    inputs_str += ", branch_cond"
                 code_lines.append(f"        {result_var} = _torch_{kernel_name}({inputs_str})")
                 current_result = result_var
 

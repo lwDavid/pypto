@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,12 @@ Example:
         default=None,
         help="Number of test cases to generate",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base seed for test generation (default: random)",
+    )
 
     return parser
 
@@ -100,17 +107,21 @@ def get_default_configs() -> list[dict[str, Any]]:
     """Get default test configurations."""
     return [
         {
-            "name": "fuzz_sequential_simple",
-            "num_instances": 1,
-            "seed": 40,
-            "enable_advanced_ops": False,
+            "name": "fuzz_sequential",
+            "num_instances": 10,
+            "seed": None,
+            "enable_advanced_ops": True,
+            "enable_for_loop": False,
+            "max_for_loop_iterations": 3,
+            "for_loop_probability": 0.7,
+            "enable_if_else": False,
             "num_kernels": 2,
             "mode": "sequential",
-            "shape": (128, 128),
-            "num_ops_range": (7, 10),
+            "shape": (64, 64),
+            "num_ops_range": (7, 8),
             "tensor_init_type": "random",
-            "input_shapes_list": [[(128, 128), (128, 128)]],
-            "description": "Branching execution: 2 kernels, same dimension inputs",
+            "input_shapes_list": [[(64, 64), (64, 64)]],
+            "description": "2-kernel sequential chain with advanced ops",
         },
     ]
 
@@ -199,6 +210,10 @@ def generate_test_cases(expanded_configs: list[dict[str, Any]], args: argparse.N
             enable_advanced_ops=test_config.get("enable_advanced_ops", False),
             advanced_ops_probability=args.advanced_ops_prob,
             tensor_init_type=test_config.get("tensor_init_type", "constant"),
+            enable_for_loop=test_config.get("enable_for_loop", False),
+            max_for_loop_iterations=test_config.get("max_for_loop_iterations", 4),
+            enable_if_else=test_config.get("enable_if_else", False),
+            for_loop_probability=test_config.get("for_loop_probability", 1.0),
         )
 
         test_code = generator.generate_test_case(
@@ -275,9 +290,22 @@ def main() -> None:
     else:
         output_path = _SCRIPT_DIR / "generated" / "test_fuzz_multi_kernel.py"
 
+    # Resolve seed: use provided value or generate a random one.
+    # Always print so CI logs can reproduce a failure with --seed <N>.
+    seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
+    print("=" * 60)
+    print(f"Fuzz seed: {seed}")
+    print("=" * 60)
+    print()
+
     all_configs = get_default_configs()
     selected_configs = select_configs(all_configs, args.config_index)
     apply_num_cases_override(selected_configs, args.num_cases)
+
+    # Propagate the resolved seed into every config so expand_configs()
+    # can derive per-instance seeds as seed+i without hitting None.
+    for config in selected_configs:
+        config["seed"] = seed
 
     print_summary(selected_configs, output_path, args)
     print_config_details(selected_configs)

@@ -58,13 +58,38 @@ class OrchestratorGenerator:
         return input_shapes_map
 
     @staticmethod
+    def _any_kernel_has_config_scalar(kernels: list[dict[str, Any]]) -> bool:
+        """Check if any kernel requires a config scalar (if/else mode)."""
+        return any(kernel.get("has_config_scalar", False) for kernel in kernels)
+
+    @staticmethod
+    def _get_config_scalar_dtype(kernels: list[dict[str, Any]]) -> str:
+        """Return the PL dtype name for the config scalar.
+
+        Reads ``config_scalar_dtype`` from the first kernel that sets
+        ``has_config_scalar``. Falls back to "INT64" for backwards compatibility.
+
+        Args:
+            kernels: List of kernel info dicts
+
+        Returns:
+            PL dtype name string, e.g. "BOOL" or "INT64"
+        """
+        for kernel in kernels:
+            if kernel.get("has_config_scalar", False):
+                return kernel.get("config_scalar_dtype", "INT64")
+        return "INT64"
+
+    @staticmethod
     def _build_params(
         input_shapes_map: dict[str, tuple[int, int]],
+        needs_config: bool = False,
     ) -> list[str]:
         """Build PL-typed parameter strings from an input shapes map.
 
         Args:
             input_shapes_map: Mapping from input names to shapes
+            needs_config: Whether to include config tensor parameter
 
         Returns:
             List of parameter strings (e.g., "x: pl.Tensor[[128, 128], pl.FP32]")
@@ -74,6 +99,8 @@ class OrchestratorGenerator:
         for name in input_params:
             inp_shape = input_shapes_map[name]
             params.append(f"{name}: pl.Tensor[[{inp_shape[0]}, {inp_shape[1]}], pl.FP32]")
+        if needs_config:
+            params.append("config: pl.Tensor[[1], pl.INT64]")
         return params
 
     def generate_sequential(
@@ -97,7 +124,9 @@ class OrchestratorGenerator:
 
         input_shapes_map = self._collect_input_shapes(kernels)
         input_params = sorted(input_shapes_map.keys())
-        params = self._build_params(input_shapes_map)
+        needs_config = self._any_kernel_has_config_scalar(kernels)
+        config_dtype = self._get_config_scalar_dtype(kernels)
+        params = self._build_params(input_shapes_map, needs_config=needs_config)
 
         # Output shape is determined by the last kernel
         output_shape = kernels[-1]["output_shape"]
@@ -107,6 +136,12 @@ class OrchestratorGenerator:
             "    @pl.function(type=pl.FunctionType.Orchestration)",
             f"    def orchestrator(self, {', '.join(params)}) -> pl.Tensor[[{rows}, {cols}], pl.FP32]:",
         ]
+
+        # Read config scalar for if/else kernels
+        if needs_config:
+            code_lines.append(
+                f"        branch_cond: pl.Scalar[pl.{config_dtype}] = pl.tensor.read(config, [0])"
+            )
 
         # Call kernels sequentially - each returns a tensor
         result_var = None
@@ -121,9 +156,17 @@ class OrchestratorGenerator:
             # Add scalar arguments
             scalar_args = [value for _, value in kernel.get("scalars", [])]
 
-            # InCore kernels return a tensor
+            # Allocate output tensor, then call kernel with it
             result_var = f"result_{i}"
-            all_args = kernel_inputs + scalar_args
+            kr, kc = kernel["output_shape"]
+            code_lines.append(
+                f"        {result_var}: pl.Tensor[[{kr}, {kc}], pl.FP32]"
+                f" = pl.create_tensor([{kr}, {kc}], dtype=pl.FP32)"
+            )
+            all_args = kernel_inputs + scalar_args + [result_var]
+            # Append branch_cond for if/else kernels
+            if kernel.get("has_config_scalar", False):
+                all_args.append("branch_cond")
             inputs_str = ", ".join(all_args)
             code_lines.append(f"        {result_var} = self.{kernel_name}({inputs_str})")
 
@@ -134,6 +177,7 @@ class OrchestratorGenerator:
             "code": "\n".join(code_lines),
             "inputs": input_params,
             "output_shape": output_shape,
+            "needs_config": needs_config,
         }
 
     def generate_branching(
@@ -157,7 +201,9 @@ class OrchestratorGenerator:
 
         input_shapes_map = self._collect_input_shapes(kernels)
         input_params = sorted(input_shapes_map.keys())
-        params = self._build_params(input_shapes_map)
+        needs_config = self._any_kernel_has_config_scalar(kernels)
+        config_dtype = self._get_config_scalar_dtype(kernels)
+        params = self._build_params(input_shapes_map, needs_config=needs_config)
 
         # In branching mode, all kernels must produce the same output shape for merging
         output_shape = kernels[0]["output_shape"]
@@ -167,6 +213,12 @@ class OrchestratorGenerator:
             "    @pl.function(type=pl.FunctionType.Orchestration)",
             f"    def orchestrator(self, {', '.join(params)}) -> pl.Tensor[[{rows}, {cols}], pl.FP32]:",
         ]
+
+        # Read config scalar for if/else kernels
+        if needs_config:
+            code_lines.append(
+                f"        branch_cond: pl.Scalar[pl.{config_dtype}] = pl.tensor.read(config, [0])"
+            )
 
         # Run all kernels in parallel - each returns a tensor
         result_vars = []
@@ -178,7 +230,14 @@ class OrchestratorGenerator:
 
             # Add scalar arguments
             scalar_args = [value for _, value in kernel.get("scalars", [])]
-            all_args = kernel_inputs + scalar_args
+            kr, kc = kernel["output_shape"]
+            code_lines.append(
+                f"        {result_var}: pl.Tensor[[{kr}, {kc}], pl.FP32]"
+                f" = pl.create_tensor([{kr}, {kc}], dtype=pl.FP32)"
+            )
+            all_args = kernel_inputs + scalar_args + [result_var]
+            if kernel.get("has_config_scalar", False):
+                all_args.append("branch_cond")
             inputs_str = ", ".join(all_args)
             code_lines.append(f"        {result_var} = self.{kernel_name}({inputs_str})")
 
@@ -190,7 +249,13 @@ class OrchestratorGenerator:
             merged = result_vars[0]
             for i in range(1, len(result_vars)):
                 new_merged = f"merged_{i}"
-                code_lines.append(f"        {new_merged} = self.merge_results({merged}, {result_vars[i]})")
+                code_lines.append(
+                    f"        {new_merged}: pl.Tensor[[{rows}, {cols}], pl.FP32]"
+                    f" = pl.create_tensor([{rows}, {cols}], dtype=pl.FP32)"
+                )
+                code_lines.append(
+                    f"        {new_merged} = self.merge_results({merged}, {result_vars[i]}, {new_merged})"
+                )
                 merged = new_merged
             code_lines.append(f"        return {merged}")
 
@@ -200,6 +265,7 @@ class OrchestratorGenerator:
             "inputs": input_params,
             "output_shape": output_shape,
             "needs_merge_kernel": len(result_vars) > 1,
+            "needs_config": needs_config,
         }
 
     def generate_mixed(
@@ -224,7 +290,9 @@ class OrchestratorGenerator:
 
         input_shapes_map = self._collect_input_shapes(kernels)
         input_params = sorted(input_shapes_map.keys())
-        params = self._build_params(input_shapes_map)
+        needs_config = self._any_kernel_has_config_scalar(kernels)
+        config_dtype = self._get_config_scalar_dtype(kernels)
+        params = self._build_params(input_shapes_map, needs_config=needs_config)
 
         # Output shape is determined by the last kernel
         output_shape = kernels[-1]["output_shape"]
@@ -234,6 +302,12 @@ class OrchestratorGenerator:
             "    @pl.function(type=pl.FunctionType.Orchestration)",
             f"    def orchestrator(self, {', '.join(params)}) -> pl.Tensor[[{rows}, {cols}], pl.FP32]:",
         ]
+
+        # Read config scalar for if/else kernels
+        if needs_config:
+            code_lines.append(
+                f"        branch_cond: pl.Scalar[pl.{config_dtype}] = pl.tensor.read(config, [0])"
+            )
 
         # Split kernels: first half runs in parallel, second half runs sequentially
         mid = len(kernels) // 2
@@ -250,16 +324,30 @@ class OrchestratorGenerator:
 
             # Add scalar arguments
             scalar_args = [value for _, value in kernel.get("scalars", [])]
-            all_args = kernel_inputs + scalar_args
+            kr, kc = kernel["output_shape"]
+            code_lines.append(
+                f"        {result_var}: pl.Tensor[[{kr}, {kc}], pl.FP32]"
+                f" = pl.create_tensor([{kr}, {kc}], dtype=pl.FP32)"
+            )
+            all_args = kernel_inputs + scalar_args + [result_var]
+            if kernel.get("has_config_scalar", False):
+                all_args.append("branch_cond")
             inputs_str = ", ".join(all_args)
             code_lines.append(f"        {result_var} = self.{kernel_name}({inputs_str})")
 
         if len(branch_results) > 1:
             code_lines.append("        # Merge parallel results")
+            merge_rows, merge_cols = parallel_kernels[0]["output_shape"]
             merged = branch_results[0]
             for i in range(1, len(branch_results)):
                 new_merged = f"merged_parallel_{i}"
-                code_lines.append(f"        {new_merged} = self.merge_results({merged}, {branch_results[i]})")
+                code_lines.append(
+                    f"        {new_merged}: pl.Tensor[[{merge_rows}, {merge_cols}], pl.FP32]"
+                    f" = pl.create_tensor([{merge_rows}, {merge_cols}], dtype=pl.FP32)"
+                )
+                code_lines.append(
+                    f"        {new_merged} = self.merge_results({merged}, {branch_results[i]}, {new_merged})"
+                )
                 merged = new_merged
             current_result = merged
         else:
@@ -274,7 +362,14 @@ class OrchestratorGenerator:
             result_var = f"sequential_{i}"
             # Add scalar arguments
             scalar_args = [value for _, value in kernel.get("scalars", [])]
-            all_args = kernel_inputs + scalar_args
+            kr, kc = kernel["output_shape"]
+            code_lines.append(
+                f"        {result_var}: pl.Tensor[[{kr}, {kc}], pl.FP32]"
+                f" = pl.create_tensor([{kr}, {kc}], dtype=pl.FP32)"
+            )
+            all_args = kernel_inputs + scalar_args + [result_var]
+            if kernel.get("has_config_scalar", False):
+                all_args.append("branch_cond")
             inputs_str = ", ".join(all_args)
             code_lines.append(f"        {result_var} = self.{kernel_name}({inputs_str})")
             current_result = result_var
@@ -287,6 +382,7 @@ class OrchestratorGenerator:
             "inputs": input_params,
             "output_shape": output_shape,
             "needs_merge_kernel": len(branch_results) > 1,
+            "needs_config": needs_config,
         }
 
     def generate_merge_kernel(self, shape: tuple[int, int] = (128, 128)) -> str:
@@ -302,7 +398,8 @@ class OrchestratorGenerator:
         code = f"""    @pl.function(type=pl.FunctionType.InCore)
     def merge_results(self, a: pl.Tensor[[{rows}, {cols}], pl.FP32],
                       b: pl.Tensor[[{rows}, {cols}], pl.FP32],
-                      output: pl.Tensor[[{rows}, {cols}], pl.FP32]) -> pl.Tensor[[{rows}, {cols}], pl.FP32]:
+                      output: pl.Out[pl.Tensor[[{rows}, {cols}], pl.FP32]]
+                      ) -> pl.Tensor[[{rows}, {cols}], pl.FP32]:
         tile_a = pl.load(a, offsets=[0, 0], shapes=[{rows}, {cols}])
         tile_b = pl.load(b, offsets=[0, 0], shapes=[{rows}, {cols}])
         result_tile = pl.add(tile_a, tile_b)

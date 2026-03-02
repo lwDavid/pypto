@@ -41,8 +41,8 @@ python tests/st/fuzz/example_mutil_kernel.py --config-index 0
 
 # Custom parameters
 python tests/st/fuzz/example_mutil_kernel.py \
-    --atol 1e-4 \
-    --rtol 1e-4 \
+    --atol 1e-5 \
+    --rtol 1e-5 \
     --advanced-ops-prob 0.7 \
     --output tests/st/fuzz/generated/my_test.py
 ```

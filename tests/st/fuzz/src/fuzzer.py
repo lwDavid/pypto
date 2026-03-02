@@ -157,6 +157,10 @@ class OpSpec:
         shape_transform: Optional callable that computes output shape from input shapes
         param_generator: Optional callable that generates operator parameters
         requires_params: Whether this operator requires parameters (default: False)
+        second_can_be_scalar: If True, the second input may be randomly replaced
+            with a scalar at generation time. The parser auto-dispatches
+            pl.add(tile, scalar) to the scalar variant, so no separate
+            block.adds / block.subs / … ops are needed.
     """
 
     name: str
@@ -167,6 +171,7 @@ class OpSpec:
     shape_transform: Any | None = None
     param_generator: Any | None = None
     requires_params: bool = False
+    second_can_be_scalar: bool = False
 
     def compute_output_shape(
         self, input_shapes: list[tuple[int, int]], params: dict[str, Any] | None = None
@@ -216,13 +221,17 @@ class OpSpec:
 
     def _compute_binary_range(self, input_ranges: list[ValueRange]) -> ValueRange:
         """Compute range for binary operations."""
-        if self.name in ["block.add", "block.adds"]:
+        if self.name == "block.add":
             return ValueRange(input_ranges[0].can_be_negative, True, input_ranges[0].can_be_positive)
-        if self.name in ["block.sub", "block.subs"]:
+        if self.name == "block.sub":
             return ValueRange(True, True, True)
-        if self.name in ["block.mul", "block.muls"] and len(input_ranges) >= 2:
-            return self._compute_mul_range(input_ranges[0], input_ranges[1])
-        if self.name in ["block.div", "block.divs", "block.row_expand_div"]:
+        if self.name == "block.mul":
+            if len(input_ranges) >= 2:
+                return self._compute_mul_range(input_ranges[0], input_ranges[1])
+            # Scalar second arg is always positive (0.1–10.0): sign is preserved
+            r0 = input_ranges[0]
+            return ValueRange(r0.can_be_negative, r0.can_be_zero, r0.can_be_positive)
+        if self.name in ["block.div", "block.row_expand_div"]:
             return ValueRange(True, input_ranges[0].can_be_zero, True)
         if self.name in ["block.maximum", "block.minimum"] and len(input_ranges) >= 2:
             return ValueRange(
@@ -267,13 +276,9 @@ class OpSpec:
         # Binary operations
         if self.name in [
             "block.add",
-            "block.adds",
             "block.sub",
-            "block.subs",
             "block.mul",
-            "block.muls",
             "block.div",
-            "block.divs",
             "block.maximum",
             "block.minimum",
         ]:
@@ -303,26 +308,31 @@ class OpFuzzer:
 
     # Block-level binary operators
     BLOCK_BINARY_OPS = [
-        OpSpec("block.add", ["tile", "tile"], "tile", {}, lambda a, b: a + b),
-        OpSpec("block.sub", ["tile", "tile"], "tile", {}, lambda a, b: a - b),
-        OpSpec("block.mul", ["tile", "tile"], "tile", {}, lambda a, b: a * b),
-        OpSpec("block.div", ["tile", "tile"], "tile", {"avoid_zero": True}, lambda a, b: a / b),
+        OpSpec("block.add", ["tile", "tile"], "tile", {}, lambda a, b: a + b, second_can_be_scalar=True),
+        OpSpec("block.sub", ["tile", "tile"], "tile", {}, lambda a, b: a - b, second_can_be_scalar=True),
+        OpSpec("block.mul", ["tile", "tile"], "tile", {}, lambda a, b: a * b, second_can_be_scalar=True),
+        OpSpec(
+            "block.div",
+            ["tile", "tile"],
+            "tile",
+            {"avoid_zero": True},
+            lambda a, b: a / b,
+            second_can_be_scalar=True,
+        ),
         OpSpec("block.maximum", ["tile", "tile"], "tile", {}, lambda a, b: np.maximum(a, b)),
         OpSpec("block.minimum", ["tile", "tile"], "tile", {}, lambda a, b: np.minimum(a, b)),
-    ]
-
-    # Block-level scalar operators
-    BLOCK_SCALAR_OPS = [
-        OpSpec("block.adds", ["tile", "scalar"], "tile", {}, lambda a, s: a + s),
-        OpSpec("block.subs", ["tile", "scalar"], "tile", {}, lambda a, s: a - s),
-        OpSpec("block.muls", ["tile", "scalar"], "tile", {}, lambda a, s: a * s),
-        OpSpec("block.divs", ["tile", "scalar"], "tile", {"avoid_zero": True}, lambda a, s: a / s),
     ]
 
     # Block-level unary operators
     BLOCK_UNARY_OPS = [
         OpSpec("block.sqrt", ["tile"], "tile", {"positive_only": True}, lambda a: np.sqrt(a)),
-        OpSpec("block.rsqrt", ["tile"], "tile", {"positive_only": True}, lambda a: 1.0 / np.sqrt(a)),
+        OpSpec(
+            "block.rsqrt",
+            ["tile"],
+            "tile",
+            {"positive_only": True, "avoid_zero": True},
+            lambda a: 1.0 / np.sqrt(a),
+        ),
         OpSpec("block.exp", ["tile"], "tile", {}, lambda a: np.exp(np.clip(a, -10, 10))),
         OpSpec("block.neg", ["tile"], "tile", {}, lambda a: -a),
         OpSpec("block.recip", ["tile"], "tile", {"avoid_zero": True}, lambda a: 1.0 / a),
@@ -334,15 +344,9 @@ class OpFuzzer:
     # Block-level row expand operators
     # Input: one [M, N] tile and one [M, 1] row vector
     # The row vector is broadcast to [M, N] before the operation
+    # NOTE: row_expand_add is excluded because the CPU simulator (SimKernel)
+    # does not implement TROWEXPANDADD_IMPL.
     BLOCK_ROW_EXPAND_OPS = [
-        OpSpec(
-            "block.row_expand_add",
-            ["tile", "tile"],
-            "tile",
-            {"row_vec_required": True},
-            lambda a, b: a + b,
-            shape_transform=lambda shapes: shapes[0] if len(shapes) >= 1 else (128, 128),
-        ),  # b is [M,1], broadcasts to [M,N], output is [M,N]
         OpSpec(
             "block.row_expand_sub",
             ["tile", "tile"],
@@ -498,7 +502,7 @@ class OpFuzzer:
         """
         self.rng = random.Random(seed)
         # Basic operators (PipeType::V - VECTOR core)
-        self.basic_vector_ops = self.BLOCK_BINARY_OPS + self.BLOCK_SCALAR_OPS + self.BLOCK_UNARY_OPS
+        self.basic_vector_ops = self.BLOCK_BINARY_OPS + self.BLOCK_UNARY_OPS
         self.vector_ops = self.basic_vector_ops
 
         # Advanced operators (PipeType::V - VECTOR core)
@@ -530,6 +534,7 @@ class OpFuzzer:
         self.exp_count = 0
         self.div_count = 0
         self.matmul_count = 0  # Track matmul usage
+        self.matmul_limit = 1  # Allow at most 1 matmul per chain (set in generate_op_chain)
         # Current kernel's pipe type (None, 'M', 'V')
         self.current_pipe_type = None
 
@@ -541,6 +546,7 @@ class OpFuzzer:
         track_shapes: bool = False,
         default_shape: tuple[int, int] = (128, 128),
         prefer_matrix_ops: bool | None = None,
+        basic_ops_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Generate a chain of operator calls.
 
@@ -560,18 +566,27 @@ class OpFuzzer:
                               operations (V-pipe). If None (default), randomly choose based on
                               availability. Once a pipe type is chosen, all operations in the
                               chain will use that type.
+            basic_ops_only: If True, only use basic element-wise ops (binary, scalar, unary).
+                           Excludes reductions, row_expand, matmul, and other ops that allocate
+                           temporary buffers. Used for if/else branches where BasicMemoryReuse
+                           cannot track buffer usage inside IfStmt branches.
         """
         self.op_usage_count = {}
         self.exp_count = 0
         self.div_count = 0
         self.matmul_count = 0  # Track matmul usage
+        self.matmul_limit = 1  # Allow at most 1 matmul per chain
         self.current_pipe_type = None
 
         # Decide pipe type: M-pipe (matrix) or V-pipe (vector)
         # Once chosen, all ops in this chain use the same pipe type
-        if prefer_matrix_ops is None:
+        if basic_ops_only:
+            # For if/else branches: only basic element-wise ops to avoid
+            # triggering BasicMemoryReuse bugs with buffer allocations
+            prefer_matrix_ops = False
+        elif prefer_matrix_ops is None:
             # Auto-select: use matrix ops with 1% probability (when available)
-            if self.matrix_ops and self.rng.random() < 0.01:
+            if self.matrix_ops and self.rng.random() < 0.05:
                 prefer_matrix_ops = True
             else:
                 prefer_matrix_ops = False
@@ -579,6 +594,9 @@ class OpFuzzer:
         if prefer_matrix_ops and self.matrix_ops:
             self.ops = self.matrix_ops
             self.current_pipe_type = "M"
+        elif basic_ops_only:
+            self.ops = self.basic_vector_ops
+            self.current_pipe_type = "V"
         else:
             self.ops = self.vector_ops
             self.current_pipe_type = "V"
@@ -670,9 +688,29 @@ class OpFuzzer:
             skip_operation = False  # Flag to skip this operation if inputs are incompatible
 
             for input_type in op.input_types:
-                if input_type == "tile":
+                # For ops with second_can_be_scalar, randomly redirect the 2nd
+                # tile input to the scalar path (parser auto-dispatches pl.add
+                # to adds when it sees a scalar second argument).
+                effective_type = input_type
+                if (
+                    input_type == "tile"
+                    and input_idx == 1
+                    and op.second_can_be_scalar
+                    and allow_scalars
+                    and self.rng.random() < 0.5
+                ):
+                    effective_type = "scalar"
+
+                if effective_type == "tile":
                     candidate_tiles = available_tiles
                     needs_abs_wrapper = False  # Flag to insert abs operation
+
+                    # Matmul inputs must come from original tile_ vars (moved to L0A/L0B).
+                    # L0C results (tmp_N) from prior matmuls cannot be directly reused as
+                    # matmul operands without going through DDR — doing so causes a
+                    # "Non-conforming matrix fractal" compile error.
+                    if op.constraints.get("requires_memory_management", False):
+                        candidate_tiles = [t for t in candidate_tiles if t.startswith("tile_")]
 
                     # Filter by value range constraints first
                     if op.constraints.get("positive_only", False):
@@ -900,7 +938,7 @@ class OpFuzzer:
 
                     input_idx += 1
 
-                elif input_type == "scalar":
+                elif effective_type == "scalar":
                     # Limit to at most 2 unique scalars, prefer reusing existing ones
                     if available_scalars:
                         scalar_value = self.rng.choice(available_scalars)
@@ -975,6 +1013,7 @@ class OpFuzzer:
                         available_tiles,
                         variable_shapes,
                         variable_usage_count,
+                        variable_ranges,
                         default_shape,
                         next_tmp_index,
                     )
@@ -1003,6 +1042,15 @@ class OpFuzzer:
             for unused_input in unused_inputs:
                 if operations:
                     current_final = operations[-1]["output"]
+
+                    # Skip if shapes are incompatible (e.g., [M,1] + [M,N])
+                    if track_shapes:
+                        unused_shape = variable_shapes.get(unused_input, default_shape)
+                        final_shape = variable_shapes.get(current_final, default_shape)
+                        if unused_shape != final_shape:
+                            used_inputs.add(unused_input)  # Mark as used to avoid infinite loop
+                            continue
+
                     output = f"tmp_{len(operations)}"
 
                     op_dict = {
@@ -1047,6 +1095,14 @@ class OpFuzzer:
 
                 for unused_var in unused_intermediates:
                     current_final = operations[-1]["output"]
+
+                    # Skip if shapes are incompatible (e.g., [M,1] + [M,N])
+                    if track_shapes:
+                        unused_shape = variable_shapes.get(unused_var, default_shape)
+                        final_shape = variable_shapes.get(current_final, default_shape)
+                        if unused_shape != final_shape:
+                            continue
+
                     output = f"tmp_{len(operations)}"
 
                     op_dict = {
@@ -1074,6 +1130,38 @@ class OpFuzzer:
 
         return operations
 
+    def generate_branched_op_chains(
+        self,
+        num_ops_per_branch: int,
+        input_count: int,
+        num_branches: int = 2,
+        **kwargs: Any,
+    ) -> list[list[dict[str, Any]]]:
+        """Generate multiple independent op chains sharing the same inputs.
+
+        Each branch is generated independently via generate_op_chain().
+        All branches use the same input_count and produce compatible output shapes.
+
+        Args:
+            num_ops_per_branch: Number of operations per branch (minimum 1)
+            input_count: Number of input tensors shared across branches
+            num_branches: Number of branches to generate (default 2 for if/else)
+            **kwargs: Additional arguments forwarded to generate_op_chain()
+
+        Returns:
+            List of op chains, one per branch
+        """
+        num_ops_per_branch = max(1, num_ops_per_branch)
+        branches = []
+        for _ in range(num_branches):
+            chain = self.generate_op_chain(
+                num_ops=num_ops_per_branch,
+                input_count=input_count,
+                **kwargs,
+            )
+            branches.append(chain)
+        return branches
+
     def _try_expand_row_vec(
         self,
         row_vec_name: str,
@@ -1081,6 +1169,7 @@ class OpFuzzer:
         available_tiles: list[str],
         variable_shapes: dict[str, tuple[int, int]],
         variable_usage_count: dict[str, int],
+        variable_ranges: dict[str, ValueRange],
         default_shape: tuple[int, int],
         next_tmp_index: int,
     ) -> int:
@@ -1124,6 +1213,11 @@ class OpFuzzer:
             if "div" not in op.name or self.div_count < 5  # Limit div operations
         ]
 
+        # Safety: filter out row_expand_div when row vector can be zero
+        row_vec_range = variable_ranges.get(row_vec_name)
+        if row_vec_range and not row_vec_range.is_safe_for_div():
+            row_expand_ops = [op for op in row_expand_ops if "div" not in op.name]
+
         if not row_expand_ops:
             return next_tmp_index
 
@@ -1144,6 +1238,12 @@ class OpFuzzer:
         available_tiles.append(output_name)
         variable_shapes[output_name] = regular_shape
         variable_usage_count[output_name] = 0
+
+        # Compute output value range
+        input_ranges = [variable_ranges.get(regular_tile), variable_ranges.get(row_vec_name)]
+        if all(r is not None for r in input_ranges):
+            output_range = expand_op.compute_output_range(input_ranges)
+            variable_ranges[output_name] = output_range
 
         variable_usage_count[regular_tile] = variable_usage_count.get(regular_tile, 0) + 1
         variable_usage_count[row_vec_name] = variable_usage_count.get(row_vec_name, 0) + 1
@@ -1281,14 +1381,18 @@ class OpFuzzer:
             if "div" in op.name and self.div_count >= 5:
                 continue  # Skip div: limit reached to avoid precision loss
 
-            # Limit matmul operations to 2-3 times max
-            if "matmul" in op.name and self.matmul_count >= 3:
-                continue  # Skip matmul if already used 3 times
+            # Limit matmul operations to at most matmul_limit (1 or 2, chosen per chain)
+            if "matmul" in op.name and self.matmul_count >= self.matmul_limit:
+                continue  # Skip matmul if already used 2 times
 
             tile_inputs = sum(1 for t in op.input_types if t == "tile")
             scalar_inputs = sum(1 for t in op.input_types if t == "scalar")
 
-            has_tiles = len(available_tiles) >= tile_inputs
+            # If the second arg can optionally be scalar, we only need 1 tile minimum
+            min_tiles_needed = (
+                max(1, tile_inputs - 1) if (op.second_can_be_scalar and allow_scalars) else tile_inputs
+            )
+            has_tiles = len(available_tiles) >= min_tiles_needed
             has_scalars = (scalar_inputs == 0) or (
                 allow_scalars and (len(available_scalars) >= scalar_inputs or scalar_inputs > 0)
             )
@@ -1315,14 +1419,17 @@ class OpFuzzer:
                     # Need at least one tile that is guaranteed non-zero (for divisor)
                     # For binary ops, only the second operand (divisor) needs to be non-zero
                     if tile_inputs == 2:
-                        # For div operations, we need at least one non-zero tile for divisor
-                        nonzero_tiles = [
-                            t
-                            for t in available_tiles
-                            if t in variable_ranges and variable_ranges[t].is_safe_for_div()
-                        ]
-                        if len(nonzero_tiles) < 1:
-                            continue  # No safe divisor available
+                        # If the divisor can be a scalar (always in [0.1, 10.0]), always safe
+                        if op.second_can_be_scalar and allow_scalars:
+                            pass  # Scalar divisor is guaranteed non-zero
+                        else:
+                            nonzero_tiles = [
+                                t
+                                for t in available_tiles
+                                if t in variable_ranges and variable_ranges[t].is_safe_for_div()
+                            ]
+                            if len(nonzero_tiles) < 1:
+                                continue  # No safe divisor available
                     elif tile_inputs == 1:
                         # For recip, the single input must be non-zero
                         nonzero_tiles = [
