@@ -341,7 +341,7 @@ static std::string MakeBlockStoreCodegenPTO(const CallPtr& op, codegen::CodegenB
   }
   tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
   codegen.Emit(tstore_line.str());
-  return "";  // Multi-line emission
+  return "";
 }
 
 // Helper function for block.alloc (no-op: allocation handled elsewhere)
@@ -578,7 +578,7 @@ REGISTER_BACKEND_OP(Backend910B_PTO, "block.reshape")
     .set_pipe(ir::PipeType::V)
     .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
       auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
-      CHECK(op->args_.size() >= 1) << "Operation:[pto.treshape] requires at least 1 argument, but got "
+      CHECK(op->args_.size() == 2) << "Operation:[block.reshape] requires 2 arguments (tile, shape), but got "
                                    << op->args_.size();
       // Only use the first argument (source tile); shape tuple is metadata
       std::string src = codegen.GetExprAsCode(op->args_[0]);
