@@ -74,6 +74,8 @@ static std::string DataTypeToMLIRImpl(::pypto::DataType dtype) {
     return "i8";
   } else if (dtype == ::pypto::DataType::UINT8) {
     return "ui8";
+  } else if (dtype == ::pypto::DataType::BOOL) {
+    return "i1";
   } else {
     throw pypto::ValueError("Invalid DataType value");
   }

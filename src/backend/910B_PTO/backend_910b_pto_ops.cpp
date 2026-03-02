@@ -447,7 +447,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"block.move_fp",         "pto.tmov.fp",          2, PipeType::MTE1},
     {"block.transpose",       "pto.ttrans",           3},
     {"block.extract",         "pto.textract",         3},
-    {"block.reshape",         "pto.treshape",         1},
     // Gather/scatter operations
     {"block.gather",          "pto.tgather",          2},
     {"block.gatherb",         "pto.tgatherb",         2},
@@ -503,6 +502,14 @@ REGISTER_BACKEND_OP(Backend910B_PTO, "block.alloc")
     .set_pipe(ir::PipeType::MTE2)
     .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       return MakeBlockAllocCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "block.create_tile")
+    .set_pipe(ir::PipeType::MTE2)
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+      (void)op;
+      (void)codegen_base;
+      return std::string("");  // No MLIR emission - tile allocation handled by pto.alloc_tile
     });
 
 REGISTER_BACKEND_OP(Backend910B_PTO, "block.store_fp")
@@ -565,6 +572,27 @@ REGISTER_BACKEND_OP(Backend910B_PTO, "block.print")
     .set_pipe(ir::PipeType::V)
     .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       return MakePrintCodegenPTO("pto.tprint", op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "block.reshape")
+    .set_pipe(ir::PipeType::V)
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+      auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+      CHECK(op->args_.size() >= 1) << "Operation:[pto.treshape] requires at least 1 argument, but got "
+                                   << op->args_.size();
+      // Only use the first argument (source tile); shape tuple is metadata
+      std::string src = codegen.GetExprAsCode(op->args_[0]);
+      std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+      std::string result_target = codegen.GetCurrentResultTarget();
+      std::string result_type = codegen.GetCurrentResultTileBufTypeString();
+      std::ostringstream oss;
+      oss << "pto.treshape ins(" << src;
+      if (!src_type.empty()) oss << " : " << src_type;
+      oss << ") outs(" << result_target;
+      if (!result_type.empty()) oss << " : " << result_type;
+      oss << ")";
+      codegen.Emit(oss.str());
+      return std::string("");
     });
 
 }  // namespace backend
