@@ -573,19 +573,37 @@ class TestIRBuilderLet:
         func = f.get_result()
         assert func is not None
 
-    def test_let_with_type_mismatch(self):
-        """Test that let() raises error when explicit type doesn't match inferred type."""
+    def test_let_with_compatible_type_override(self):
+        """Test that let() allows type override with same-kind type (e.g., adding memref)."""
         ib = IRBuilder()
 
-        with pytest.raises(ValueError, match="Type mismatch"):
+        with ib.function("override_test") as f:
+            f.return_type(ir.TensorType([64], DataType.FP32))
+
+            # Create a tensor expression
+            param = f.param("x", ir.TensorType([64], DataType.FP32))
+
+            # Override with same-kind type that includes memref
+            span = ir.Span.unknown()
+            memref = ir.MemRef(ir.MemorySpace.DDR, ir.ConstInt(0, DataType.INT64, span), 256, 0)
+            override_type = ir.TensorType([64], DataType.FP32, memref)
+
+            x = ib.let("x", param, type=override_type)
+            assert isinstance(x.type, ir.TensorType)
+            assert x.type.memref is not None
+
+    def test_let_with_incompatible_type_override(self):
+        """Test that let() rejects incompatible type overrides (different type kinds)."""
+        ib = IRBuilder()
+
+        with pytest.raises(TypeError, match="incompatible"):
             with ib.function("mismatch_test") as f:
                 f.return_type(ir.ScalarType(DataType.INT64))
 
-                # Create INT64 expression but provide FP32 type
+                # Create INT64 scalar but try to override with TensorType
                 const = ir.ConstInt(42, DataType.INT64, ir.Span.unknown())
-                wrong_type = ir.ScalarType(DataType.FP32)
+                wrong_type = ir.TensorType([64], DataType.FP32)
 
-                # This should raise ValueError
                 ib.let("x", const, type=wrong_type)
 
     def test_let_with_scalar_value(self):

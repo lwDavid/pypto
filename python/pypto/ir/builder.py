@@ -14,6 +14,7 @@ Provides a Pythonic API for building IR using context managers with
 automatic span tracking via the inspect module.
 """
 
+import builtins
 import inspect
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -337,7 +338,9 @@ class IRBuilder:
         common pattern of creating a variable and immediately assigning to it.
 
         The type is automatically inferred from the value expression. If an explicit
-        type is provided, it is used to validate that the inferred type matches.
+        type is provided, it overrides the inferred type — but must be the same type
+        kind (e.g., TensorType can only override TensorType). This supports
+        annotation-driven metadata like memref on Tile/Tensor types.
 
         For Call expressions with GlobalVar ops, the return type is automatically
         inferred from the function signature if available.
@@ -345,20 +348,20 @@ class IRBuilder:
         Args:
             name: Variable name
             value: Expression value (int, float, or Expr)
-            type: Optional type for validation. If provided, must match the inferred type.
+            type: Optional type override. Must be same type kind as inferred type.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
             Var: The created variable
 
         Raises:
-            ValueError: If explicit type is provided and doesn't match inferred type
+            TypeError: If override type is incompatible with inferred type
 
         Example:
             >>> # Type is inferred from the expression:
             >>> x = ib.let("x", 42)
-            >>> # Or with explicit type validation:
-            >>> x = ib.let("x", 42, type=ir.ScalarType(ir.DataType.INT64))
+            >>> # Override with compatible type (same kind, adds memref):
+            >>> x = ib.let("x", expr, type=ir.TensorType([64], dt, memref))
             >>> # For function calls, type is auto-inferred from function signature:
             >>> result = ib.let("result", ir.Call(func_gvar, [x], span))
         """
@@ -384,14 +387,23 @@ class IRBuilder:
         # Infer type from the value expression
         inferred_type = value_expr.type
 
-        # If explicit type is provided, validate it matches the inferred type
-        if type is not None and type != inferred_type:
-            raise ValueError(
-                f"Type mismatch in let statement for variable '{name}':\n"
-                f"  Inferred type: {inferred_type}\n"
-                f"  Provided type: {type}"
-            )
-        final_type = inferred_type
+        # If explicit type is provided, validate compatibility then use as override.
+        # Overrides are only allowed when:
+        # - inferred type is unknown (no inference available), OR
+        # - override type is the same kind as inferred type (e.g., TensorType→TensorType)
+        # This prevents creating vars with incompatible declared types.
+        if type is not None:
+            if not isinstance(inferred_type, ir.UnknownType) and builtins.type(type) is not builtins.type(
+                inferred_type
+            ):
+                raise TypeError(
+                    f"Type override for '{name}' is incompatible: "
+                    f"inferred {builtins.type(inferred_type).__name__} "
+                    f"but override is {builtins.type(type).__name__}"
+                )
+            final_type = type
+        else:
+            final_type = inferred_type
 
         var = self._builder.var(name, final_type, actual_span)
         self._builder.assign(var, value_expr, actual_span)
