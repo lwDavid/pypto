@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <queue>
@@ -57,7 +58,9 @@ constexpr int kCastModeRound = 2;
 enum class CastArch { A2A3, A5 };
 
 CastArch ResolveCastArch() {
-  const auto* handler = PassContext::Current()->GetBackendHandler();
+  const auto* ctx = PassContext::Current();
+  INTERNAL_CHECK(ctx) << "LegalizeTileCast requires an active PassContext";
+  const auto* handler = ctx->GetBackendHandler();
   INTERNAL_CHECK(handler) << "LegalizeTileCast requires a configured BackendHandler";
   const std::string arch = handler->GetPtoTargetArch();
   if (arch == "a5") {
@@ -219,7 +222,7 @@ std::vector<DataType> FindCastChain(const AdjList& adj, DataType from, DataType 
     int dist = -1;
     int pref = 0;
   };
-  std::unordered_map<uint8_t, NodeInfo> info;
+  std::array<NodeInfo, 256> info{};
   std::queue<uint8_t> q;
 
   info[from.Code()] = NodeInfo{from.Code(), from, 0, 0};
@@ -246,20 +249,20 @@ std::vector<DataType> FindCastChain(const AdjList& adj, DataType from, DataType 
       const int edge_cost = EdgePreferenceCost(cur_info.via, nxt);
       const int new_dist = cur_info.dist + 1;
       const int new_pref = cur_info.pref + edge_cost;
-      auto nit = info.find(nxt.Code());
-      if (nit == info.end() || nit->second.dist < 0) {
-        info[nxt.Code()] = NodeInfo{cur, nxt, new_dist, new_pref};
+      NodeInfo& nxt_info = info[nxt.Code()];
+      if (nxt_info.dist < 0) {
+        nxt_info = NodeInfo{cur, nxt, new_dist, new_pref};
         q.push(nxt.Code());
-      } else if (nit->second.dist == new_dist && new_pref < nit->second.pref) {
-        nit->second.parent = cur;
-        nit->second.via = nxt;
-        nit->second.pref = new_pref;
+      } else if (nxt_info.dist == new_dist && new_pref < nxt_info.pref) {
+        nxt_info.parent = cur;
+        nxt_info.via = nxt;
+        nxt_info.pref = new_pref;
       }
     }
   }
 
-  auto goal = info.find(to.Code());
-  if (goal == info.end() || goal->second.dist < 0) {
+  const NodeInfo& goal = info[to.Code()];
+  if (goal.dist < 0) {
     return {};
   }
 
