@@ -2251,7 +2251,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
   // no-op there. Emitted on the producer task's L0TaskArgs before its rt_submit_* —
   // see simpler#1065 ("codegen-side emission of set_allow_early_resolve()").
   void EmitEarlyResolveHint(const std::string& task_var, const CallPtr& call) {
-    if (call->GetAttr<bool>("allow_early_resolve", false)) {
+    // The a5 (Ascend950) runtime build has no set_allow_early_resolve on
+    // L0TaskArgs, so the early-dispatch hint is dropped on a5 targets.
+    if (call->GetAttr<bool>("allow_early_resolve", false) &&
+        pypto::backend::GetBackendType() != pypto::backend::BackendType::Ascend950) {
       EmitIndentedLine(task_var + ".set_allow_early_resolve(true);");
     }
   }
