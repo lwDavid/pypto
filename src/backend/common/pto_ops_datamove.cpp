@@ -144,6 +144,26 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
       << "Internal error: tile.assemble carries a FIXPIPE epilogue (pre_quant / pre_relu) but does not "
          "lower to pto.tinsert; the epilogue would be dropped";
 
+  if (source_tile_type->dtype_.IsPackedFp4()) {
+    // The type deducer admits native FP4 insertion only for matching NZ views.
+    // Its dedicated TINSERT path converts logical columns into carrier bytes;
+    // generic TMOV and the ND insert path do not, including preservation copies.
+    auto emit_insert = [&](const std::string& input, const std::string& input_type, const std::string& row,
+                           const std::string& col) {
+      codegen.Emit("pto.tinsert ins(" + input + ", " + row + ", " + col + " : " + input_type +
+                   ", index, index) outs(" + dst + " : " + dst_type + ")");
+    };
+    if (target != dst) {
+      CHECK_SPAN(target_tile_type->memory_space_ == ir::MemorySpace::Vec, op->span_)
+          << "tile.assemble: packed FP4 Mat insertion requires the result to reuse the Mat target; "
+             "a preservation copy from Mat is unsupported";
+      const std::string zero = codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX);
+      emit_insert(target, codegen.GetExprTypeAnnotation(op->args_[0]), zero, zero);
+    }
+    emit_insert(src, src_type, row_off, col_off);
+    return "";
+  }
+
   // Self-copy: the source *is* the destination window. `tile.slice` lowers to a
   // `pto.subview` and registers its (base, row, col) SSAs, so when the source
   // resolves to a subview of this very `dst` at this very offset, the data is

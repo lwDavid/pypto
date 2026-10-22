@@ -16,6 +16,7 @@ import pytest
 from pypto import ir
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.language.parser.diagnostics import InvalidOperationError
 from pypto.pypto_core import codegen, passes
 
 _FP4_BYTE_ALIAS_PAIRS = [
@@ -32,10 +33,10 @@ def _reset_backend_after_test():
     reset_for_testing()
 
 
-def _emit_incore_mlir(program, planner=passes.MemoryPlanner.PYPTO) -> str:
+def _emit_incore_mlir(program, planner=passes.MemoryPlanner.PYPTO, *, enable_buffer_ir=True) -> str:
     reset_for_testing()
     set_backend_type(BackendType.Ascend950)
-    with passes.PassContext([], memory_planner=planner):
+    with passes.PassContext([], memory_planner=planner, enable_buffer_ir=enable_buffer_ir):
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
     parts: list[str] = []
     for func in optimized.functions.values():
@@ -349,46 +350,50 @@ def test_fp4e2m1x2_gm_views_preserve_carrier_units():
     assert all("sizes = [%c2_index, %c16_index, %c32_index]" in line for line in partitions3), mlir3
 
 
-def test_fp4e2m1x2_rejects_column_vector_last_carrier_dim_one():
-    """Carrier last-dim 1 would force DN; packed FP4E2M1X2 bans that path."""
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_packed_fp4_preserves_nd_for_one_carrier_width(dtype):
+    """One carrier is two nibbles, so the GM layout must stay ND."""
 
     @pl.program
     class ColVecPacked:
         @pl.function(type=pl.FunctionType.InCore)
         def main(
             self,
-            src: pl.Tensor[[32, 1], pl.FP4E2M1X2],
-            out: pl.Out[pl.Tensor[[32, 1], pl.FP4E2M1X2]],
-        ) -> pl.Tensor[[32, 1], pl.FP4E2M1X2]:
+            src: pl.Tensor[[32, 1], dtype],
+            out: pl.Out[pl.Tensor[[32, 1], dtype]],
+        ) -> pl.Tensor[[32, 1], dtype]:
             return pl.store(pl.load(src, [0, 0], [32, 1]), [0, 0], out)
 
-    with pytest.raises(ValueError, match=r"last carrier dimension 1|column-vector"):
-        _emit_incore_mlir(ColVecPacked)
+    mlir = _emit_incore_mlir(ColVecPacked)
+    views = [line for line in mlir.splitlines() if "pto.make_tensor_view" in line]
+    assert views and all("layout = #pto.layout<nd>" in line for line in views), mlir
+    allocations = [line for line in mlir.splitlines() if "pto.alloc_tile" in line]
+    assert allocations and all("blayout=row_major" in line for line in allocations), mlir
 
 
-def test_fp4e2m1x2_rejects_explicit_dn_param_annotation():
-    """Non-ND annotations on packed FP4E2M1X2 are rejected at make_tensor_view."""
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_packed_fp4_preserves_dn_carrier_geometry(dtype):
+    """DN packs the row axis; GM offsets and strides remain carrier units."""
 
     @pl.program
     class DnAnnotated:
         @pl.function(type=pl.FunctionType.InCore)
         def main(
             self,
-            src: pl.Tensor[
-                [16, 32],
-                pl.FP4E2M1X2,
-                pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
-            ],
-            out: pl.Out[pl.Tensor[[16, 32], pl.FP4E2M1X2]],
-        ) -> pl.Tensor[[16, 32], pl.FP4E2M1X2]:
-            return pl.store(pl.load(src, [0, 0], [16, 32]), [0, 0], out)
+            src: pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+            out: pl.Out[pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)]],
+        ) -> pl.Tensor[[64, 32], dtype, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)]:
+            return pl.tile.store(pl.tile.load(src, [32, 0], [32, 32]), [0, 0], out)
 
-    with pytest.raises(ValueError, match=r"FP4E2M1X2 supports ND layout only"):
-        _emit_incore_mlir(DnAnnotated)
+    mlir = _emit_incore_mlir(DnAnnotated)
+    views = [line for line in mlir.splitlines() if "pto.make_tensor_view" in line]
+    assert views and all("strides = [%c1_index, %c64_index]" in line for line in views), mlir
+    allocations = [line for line in mlir.splitlines() if "pto.alloc_tile" in line]
+    assert allocations and all("blayout=col_major" in line for line in allocations), mlir
 
 
-def test_fp4e2m1x2_slice_cast_and_vec_move():
-    """Even last-axis slice + cast emits f4x2; move stays on Vec."""
+def test_fp4e2m1x2_slice_cast_preserves_carrier_offset():
+    """An E2M1 carrier slice retains its byte offset before the existing FP8 cast."""
 
     @pl.program
     class CastProg:
@@ -406,20 +411,6 @@ def test_fp4e2m1x2_slice_cast_and_vec_move():
     fp4_load = next(line for line in mlir.splitlines() if "partition_view" in line and "f4E2M1x2" in line)
     assert "offsets = [%c0_index, %c16_index]" in fp4_load, mlir
     assert "sizes = [%c16_index, %c16_index]" in fp4_load, mlir
-
-    @pl.program
-    class MoveProg:
-        @pl.function(type=pl.FunctionType.InCore)
-        def main(
-            self,
-            src: pl.Tensor[[16, 32], pl.FP4E2M1X2],
-            out: pl.Out[pl.Tensor[[16, 32], pl.FP4E2M1X2]],
-        ) -> pl.Tensor[[16, 32], pl.FP4E2M1X2]:
-            return pl.store(pl.move(pl.load(src, [0, 0], [16, 32]), target_memory=pl.Mem.Vec), [0, 0], out)
-
-    mlir_m = _emit_incore_mlir(MoveProg)
-    assert "!pto.f4E2M1x2" in mlir_m
-    assert "pto.tmov" in mlir_m or "pto.tload" in mlir_m
 
 
 @pytest.mark.parametrize(
@@ -459,6 +450,191 @@ def test_fp4e2m1x2_byte_reshape_round_trip_consumed(planner, byte_dtype, tensor_
     mlir = _emit_incore_mlir(Program, planner)
     assert "pto.tload" in mlir and "pto.tcvt" in mlir and "pto.tstore" in mlir, mlir
     assert "8x128x!pto.f4E2M1x2" in mlir or "rows=8, cols=128" in mlir, mlir
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_fp4_native_vec_copy_rejects_unsafe_byte_strides(dtype):
+    with pytest.raises(InvalidOperationError, match="Vec-to-Vec moves support only ND-to-NZ"):
+
+        @pl.program
+        class MoveProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[16, 32], dtype],
+                out: pl.Out[pl.Tensor[[16, 32], dtype]],
+            ) -> pl.Tensor[[16, 32], dtype]:
+                return pl.store(
+                    pl.move(pl.load(src, [0, 0], [16, 32]), target_memory=pl.Mem.Vec), [0, 0], out
+                )
+
+
+@pytest.mark.parametrize(("dtype", "pto_type"), [(pl.fp4e2m1x2, "f4E2M1x2"), (pl.fp4e1m2x2, "f4E1M2x2")])
+def test_fp4_make_tensor_view_preserves_carrier_units(dtype, pto_type):
+    """Rank-2/3 parameter views and partitions retain their carrier dimensions."""
+
+    @pl.program
+    class Rank2:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            src: pl.Tensor[[2, 256], dtype],
+            out: pl.Out[pl.Tensor[[2, 256], dtype]],
+        ) -> pl.Tensor[[2, 256], dtype]:
+            viewed: pl.Tensor[[2, 256], dtype] = pl.tensor.view(src, [2, 256])
+            return pl.store(pl.load(viewed, [0, 0], [2, 256]), [0, 0], out)
+
+    mlir = _emit_incore_mlir(Rank2)
+    views = [line for line in mlir.splitlines() if "pto.make_tensor_view" in line and pto_type in line]
+    assert views and all("shape = [%c2_index, %c256_index]" in line for line in views), mlir
+    assert all("strides = [%c256_index, %c1_index]" in line for line in views), mlir
+    partitions = [line for line in mlir.splitlines() if "partition_view" in line]
+    assert partitions and all(f"2x256x!pto.{pto_type}" in line for line in partitions), mlir
+
+    @pl.program
+    class Rank3:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            src: pl.Tensor[[2, 16, 32], dtype],
+            out: pl.Out[pl.Tensor[[2, 16, 32], dtype]],
+        ) -> pl.Tensor[[2, 16, 32], dtype]:
+            return pl.store(pl.load(src, [0, 0, 0], [2, 16, 32]), [0, 0, 0], out)
+
+    mlir3 = _emit_incore_mlir(Rank3)
+    assert f"!pto.{pto_type}" in mlir3
+    views3 = [line for line in mlir3.splitlines() if "pto.make_tensor_view" in line]
+    assert views3 and all("shape = [%c2_index, %c16_index, %c32_index]" in line for line in views3), mlir3
+    assert "arith.muli %c32_index, %c16_index : index" in mlir3, mlir3
+    assert "arith.muli %c32_index, %c2_index : index" not in mlir3, mlir3
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+@pytest.mark.parametrize("carrier_width", [1, 2, 32])
+@pytest.mark.parametrize("tile_api", [False, True], ids=["tensor", "tile"])
+@pytest.mark.parametrize("enable_buffer_ir", [False, True])
+def test_fp4_subload_preserves_row_packing_axis(dtype, carrier_width, tile_api, enable_buffer_ir):
+    """A narrow ND window keeps row packing even at one carrier per row."""
+    tensor_width = 32
+    if tile_api:
+
+        @pl.program
+        class TileProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[32, tensor_width], dtype],
+                out: pl.Out[pl.Tensor[[32, tensor_width], dtype]],
+            ) -> pl.Tensor[[32, tensor_width], dtype]:
+                tile = pl.tile.load(src, [0, 0], [32, carrier_width])
+                return pl.tile.store(tile, [0, 0], out)
+
+        program = TileProgram
+    else:
+
+        @pl.program
+        class TensorProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[32, tensor_width], dtype],
+                out: pl.Out[pl.Tensor[[32, tensor_width], dtype]],
+            ) -> pl.Tensor[[32, tensor_width], dtype]:
+                tile = pl.load(src, [0, 0], [32, carrier_width])
+                return pl.store(tile, [0, 0], out)
+
+        program = TensorProgram
+    mlir = _emit_incore_mlir(program, enable_buffer_ir=enable_buffer_ir)
+    allocations = [line for line in mlir.splitlines() if "pto.alloc_tile" in line]
+    assert allocations, mlir
+    assert all(f"rows=32, cols={carrier_width}" in line for line in allocations), mlir
+    assert all("blayout=row_major" in line for line in allocations), mlir
+
+
+@pytest.mark.parametrize(("dtype", "pto_type"), [(pl.fp4e2m1x2, "f4E2M1x2"), (pl.fp4e1m2x2, "f4E1M2x2")])
+def test_fp4_cacheinvalid_preserves_carrier_partition(dtype, pto_type):
+    """system.cacheinvalid preserves the requested byte-carrier window."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            x: pl.Tensor[[16, 32], dtype],
+            out: pl.Out[pl.Tensor[[16, 32], dtype]],
+        ) -> pl.Tensor[[16, 32], dtype]:
+            updated: pl.Tensor[[16, 32], dtype] = pl.store(pl.load(x, [0, 0], [16, 32]), [0, 0], out)
+            pl.system.cacheinvalid(updated, [16, 16], [0, 0])
+            return updated
+
+    mlir = _emit_incore_mlir(Prog)
+    cmo_lines = [line for line in mlir.splitlines() if "pto.cmo.cacheinvalid" in line]
+    assert len(cmo_lines) == 1, mlir
+    assert f"16x16x!pto.{pto_type}" in cmo_lines[0], cmo_lines[0]
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_fp4_nz_assemble_uses_native_insert(dtype):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIV)
+        def fp4_nz_insert(
+            self,
+            original: pl.Tensor[[64, 128], dtype],
+            update: pl.Tensor[[32, 64], dtype],
+        ):
+            original_nd = pl.tile.load(original, [0, 0], [64, 128])
+            original_nz = pl.tile.move(
+                original_nd,
+                target_memory=pl.Mem.Vec,
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            target = pl.tile.move(original_nz, target_memory=pl.Mem.Mat)
+            update_nd = pl.tile.load(update, [0, 0], [32, 64])
+            update_nz = pl.tile.move(
+                update_nd,
+                target_memory=pl.Mem.Vec,
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            assembled = pl.tile.assemble(target, update_nz, [0, 64])
+            pl.tile.set_validshape(assembled, 32, 256)
+
+    mlir = _emit_incore_mlir(Program)
+    inserts = [line for line in mlir.splitlines() if "pto.tinsert " in line]
+    assert inserts, mlir
+    assert any(
+        "rows=16, cols=128" in line and "rows=32, cols=256" in line and "%c64_index" in line
+        for line in inserts
+    ), mlir
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_fp4_nz_assemble_rejects_automatic_mixed_expansion(dtype):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def fp4_nz_insert(
+            self,
+            original: pl.Tensor[[64, 128], dtype],
+            update: pl.Tensor[[32, 64], dtype],
+        ):
+            # Direct GM-to-Mat loading isolates the insert guard: no earlier
+            # Vec-to-Mat move can reject the function before the insertion.
+            target = pl.tile.load(original, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+            update_nd = pl.tile.load(update, [0, 0], [32, 64])
+            update_nz = pl.tile.move(
+                update_nd,
+                target_memory=pl.Mem.Vec,
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            assembled = pl.tile.assemble(target, update_nz, [0, 64])
+            pl.tile.set_validshape(assembled, 32, 256)
+
+    with pytest.raises(ValueError, match="use an explicit FunctionType.AIV"):
+        _emit_incore_mlir(Program)
 
 
 if __name__ == "__main__":

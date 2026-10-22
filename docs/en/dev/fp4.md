@@ -46,18 +46,22 @@ numerical results.
 
 ## Operator support on Ascend950
 
-Both formats support ND numerical casts. Additional transfer layouts, DN
-casts, and MXFP4 quantization are deferred.
+Both formats support ND numerical casts and the byte-preserving transfers
+below. DN numerical casts and MXFP4 quantization are deferred.
 
 | Operation | Support |
 | --------- | ------- |
-| Packed GM views | ND carrier dimensions and strides; PTOAS v0.67 handles DMA descriptor conversion |
+| Packed GM views and load/store | Both formats, ND/DN carrier dimensions, strides, and offsets; a one-carrier width stays ND; PTOAS v0.67 handles DMA descriptor conversion |
 | Either packed format ↔ UINT8/INT8 alias | Same-shape, dense addressed 2D row-major Vec storage; PYPTO or DSA_RP planning |
 | Either packed format ↔ BF16 cast | Native TCVT on row-major, unboxed Vec; the last axis expands/contracts 2:1 |
 | Either packed format → FP8E4M3FN/FP8E5M2 cast | Legalized through BF16 and FP32, with a warning; a host reference or lookup table remains an alternative |
 | E2M1↔E1M2 conversion | Numerical cast through BF16; carrier shape is unchanged |
 | Other wider-type casts | Existing legalization with lossless intermediates; see the encoding constraint below |
-| DN, NZ, column-major, column-vector `[M,1]`, or layout-changing packed views | Additional transfer layouts and DN casts are deferred |
+| Packed Vec layout conversion | ND→NZ; carrier geometry changes with the packing axis while preserving the value geometry |
+| Packed Vec→Mat transfer | Matching layouts, explicit AIV function; generic InCore mixed-core expansion is rejected |
+| Native packed `extract` / `assemble` | Restricted layout-preserving cube/NZ paths with zero offset on the packed axis; use INT8 aliases for general Vec extraction and UINT8 aliases for ND insertion |
+| `fillpad`, `fillpad_expand`, `fillpad_inplace` | Both formats, ND Vec; zero/min/max padding preserves the valid carrier rectangle |
+| DN numerical casts | Deferred; transfer support does not enable column-major TCVT |
 | Direct packed `reshape` or `transpose` | Unsupported; reshape a byte alias where the existing alias contract permits it |
 | Native packed FP4 `matmul_mx` | Unsupported by the pinned PTOAS geometry contract; cast ND operands to FP8 first |
 | MXFP4 `quant_mx` | Deferred; `quant_mx` remains MXFP8-only |
@@ -65,7 +69,9 @@ casts, and MXFP4 quantization are deferred.
 
 PTO GM views retain carrier coordinates. The conversion to the lower-level
 instruction's value geometry belongs to PTOAS; scaling the GM shape again in
-PyPTO would double its row pitch.
+PyPTO would double its row pitch. Physical tiles still need ISA alignment,
+including a 32-byte ND Vec row pitch; use padded storage with `valid_shape`
+for a narrower carrier window.
 
 ## Numerical cast constraints
 
@@ -119,6 +125,10 @@ PYPTO and DSA_RP planning emit addressed aliases. PTOAS planning remains
 unsupported for this path because its `treshape` rejects the packed FP4 type.
 Aliasing preserves bits; it does not numerically convert one FP4 format into
 the other.
+
+Partial-transfer hardware tests compare every carrier byte, including untouched
+output regions. The pinned simulator corrupts DN results, and its partial ND
+case crashes during cleanup despite matching bytes; these cases run on A5 only.
 
 ## See also
 

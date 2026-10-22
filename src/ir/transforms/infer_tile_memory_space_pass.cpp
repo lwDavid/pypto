@@ -640,7 +640,11 @@ class TileMemorySpaceMutator : public IRMutator {
     if (tile_type->memory_space_ != mem_it->second) {
       TileView source = tile_view_semantics::GetEffectiveTileView(*tile_type);
       TileView target_layout = tile_view_semantics::GetImplicitTileView(tile_type->shape_, mem_it->second);
-      source.blayout = target_layout.blayout;
+      // Vec FP4 layouts identify the carrier packing axis. Preserve an
+      // explicit ND/DN producer view when resolving the memory space.
+      if (!tile_type->dtype_.IsPackedFp4() || mem_it->second != MemorySpace::Vec) {
+        source.blayout = target_layout.blayout;
+      }
       source.slayout = target_layout.slayout;
       source.fractal = target_layout.fractal;
       new_view = std::move(source);
@@ -881,7 +885,24 @@ class TileMemorySpaceMutator : public IRMutator {
             const bool probe_describes_this_call =
                 probe_type &&
                 tile_view_semantics::ShapeExprListsEquivalent(probe_type->shape_, old_call_type->shape_);
-            if (probe_describes_this_call) {
+            // Packed FP4 changes carrier geometry when Mat promotion changes
+            // its packing axis. That shape difference is intentional, not an
+            // ND-to-2D flattening mismatch. Re-deduce the original load first
+            // to establish that its region arguments still describe this tile.
+            bool packed_load_geometry_changed = false;
+            if (!probe_describes_this_call && probe_type && IsOp(call, "tile.load") &&
+                old_call_type->dtype_.IsPackedFp4()) {
+              auto original_probe = registry.Create(call_op_name, call->args_, call->kwargs_, call->span_);
+              auto original_type = As<TileType>(original_probe->GetType());
+              packed_load_geometry_changed =
+                  original_type &&
+                  tile_view_semantics::ShapeExprListsEquivalent(original_type->shape_, old_call_type->shape_);
+            }
+            auto promoted_shape = old_call_type->shape_;
+            if (packed_load_geometry_changed) {
+              promoted_shape = probe_type->shape_;
+              promoted_view = tile_view_semantics::GetEffectiveTileView(*probe_type);
+            } else if (probe_describes_this_call) {
               TileView probe_view = tile_view_semantics::GetEffectiveTileView(*probe_type);
               promoted_view.blayout = probe_view.blayout;
               promoted_view.slayout = probe_view.slayout;
@@ -891,7 +912,7 @@ class TileMemorySpaceMutator : public IRMutator {
                   promoted_view, tile_view_semantics::GetImplicitTileLayout(old_call_type->shape_, promoted));
             }
 
-            auto promoted_type = std::make_shared<TileType>(old_call_type->shape_, old_call_type->dtype_,
+            auto promoted_type = std::make_shared<TileType>(promoted_shape, old_call_type->dtype_,
                                                             old_call_type->memref_, promoted_view, promoted);
             new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs), call->attrs_,
                                                std::move(promoted_type), call->span_);

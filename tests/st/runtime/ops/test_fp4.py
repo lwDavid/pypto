@@ -7,8 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-
-"""A5 ND numerical casts for the two packed FP4 byte-carrier formats."""
+"""A5 packed FP4 transfers and ND numerical casts."""
 
 import pypto.language as pl
 import pytest
@@ -17,7 +16,162 @@ from harness import st
 from harness.core.harness import DataType, TensorSpec
 
 _HAS_TORCH_FP4 = hasattr(torch, "float4_e2m1fn_x2")
+
+
 _TORCH_FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+
+
+ROWS, PACKED_K = 2, 256
+
+
+def _xor_row_fp4() -> torch.Tensor:
+    physical = torch.empty((ROWS, PACKED_K), dtype=torch.uint8)
+    physical[0] = torch.arange(PACKED_K, dtype=torch.uint8)
+    physical[1] = torch.arange(PACKED_K, dtype=torch.uint8).bitwise_xor(0xA5)
+    return physical.view(_TORCH_FP4_DTYPE)
+
+
+@pl.jit.incore
+def _fp4_copy_kernel(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2]],
+):
+    return pl.store(pl.load(src, [0, 0], [ROWS, PACKED_K]), [0, 0], out)
+
+
+@pl.jit
+def _fp4_copy_entry(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2]],
+):
+    return _fp4_copy_kernel(src, out)
+
+
+@pl.jit.incore
+def _fp4_view_copy_kernel(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2]],
+):
+    viewed: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2] = pl.tensor.view(src, [ROWS, PACKED_K])
+    return pl.store(pl.load(viewed, [0, 0], [ROWS, PACKED_K]), [0, 0], out)
+
+
+@pl.jit
+def _fp4_view_copy_entry(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2]],
+):
+    return _fp4_view_copy_kernel(src, out)
+
+
+@pl.jit.incore
+def _fp4_offset_copy_kernel(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K // 2], pl.fp4e2m1x2]],
+):
+    tile = pl.load(src, [0, PACKED_K // 4], [ROWS, PACKED_K // 2])
+    return pl.store(tile, [0, 0], out)
+
+
+@pl.jit
+def _fp4_offset_copy_entry(
+    src: pl.Tensor[[ROWS, PACKED_K], pl.fp4e2m1x2],
+    out: pl.Out[pl.Tensor[[ROWS, PACKED_K // 2], pl.fp4e2m1x2]],
+):
+    return _fp4_offset_copy_kernel(src, out)
+
+
+@pl.jit.incore
+def _fp4_copy_torch_default_kernel(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+    return pl.store(pl.load(src, [0, 0], [ROWS, PACKED_K]), [0, 0], out)
+
+
+@pl.jit
+def _fp4_copy_torch_default_entry(src: pl.Tensor, out: pl.Out[pl.Tensor]):
+    return _fp4_copy_torch_default_kernel(src, out)
+
+
+def _copy_golden(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {"out": tensors["src"].contiguous().view(torch.uint8).clone().view(_TORCH_FP4_DTYPE)}
+
+
+def _offset_copy_golden(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    raw = tensors["src"].view(torch.uint8)[:, PACKED_K // 4 : 3 * PACKED_K // 4]
+    return {"out": raw.contiguous().view(_TORCH_FP4_DTYPE)}
+
+
+def _compare_packed_bytes(actual, expected):
+    """Compare every carrier byte, including distinct nibble encodings."""
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        assert torch.equal(actual[name].view(torch.uint8), expected[name].view(torch.uint8)), name
+
+
+def _copy_input():
+    return TensorSpec("src", [ROWS, PACKED_K], DataType.FP4E2M1X2, init_value=lambda: _xor_row_fp4())
+
+
+def _copy_output(columns):
+    return TensorSpec(
+        "out",
+        [ROWS, columns],
+        DataType.FP4E2M1X2,
+        is_output=True,
+        init_value=lambda: torch.empty((ROWS, columns), dtype=_TORCH_FP4_DTYPE),
+    )
+
+
+def _fp4_copy_torch_default_program():
+    # This case intentionally derives its contract from native Torch tensors.
+    # Construct the samples during program building, after collection.
+    return _fp4_copy_torch_default_entry.specialize(
+        _xor_row_fp4(), torch.empty((ROWS, PACKED_K), dtype=_TORCH_FP4_DTYPE)
+    )
+
+
+@pytest.mark.skipif(not _HAS_TORCH_FP4, reason="torch.float4_e2m1fn_x2 required")
+@pytest.mark.platforms("a5", "a5sim")
+@st.cases(
+    st.case(
+        _fp4_copy_entry,
+        tensors=[_copy_input(), _copy_output(PACKED_K)],
+        name="fp4_two_row_copy",
+        golden=_copy_golden,
+        compare=_compare_packed_bytes,
+        rtol=0.0,
+        atol=0.0,
+    ),
+    st.case(
+        _fp4_view_copy_entry,
+        tensors=[_copy_input(), _copy_output(PACKED_K)],
+        name="fp4_two_row_view_copy",
+        golden=_copy_golden,
+        compare=_compare_packed_bytes,
+        rtol=0.0,
+        atol=0.0,
+    ),
+    st.case(
+        _fp4_offset_copy_entry,
+        tensors=[_copy_input(), _copy_output(PACKED_K // 2)],
+        name="fp4_two_row_offset_copy",
+        golden=_offset_copy_golden,
+        compare=_compare_packed_bytes,
+        rtol=0.0,
+        atol=0.0,
+    ),
+    st.case(
+        _fp4_copy_torch_default_program,
+        tensors=[_copy_input(), _copy_output(PACKED_K)],
+        name="fp4_two_row_copy_torch_default",
+        golden=_copy_golden,
+        compare=_compare_packed_bytes,
+        rtol=0.0,
+        atol=0.0,
+    ),
+)
+def test_fp4_copy_runtime(case_run):
+    case_run.assert_passed()
+
 
 CAST_ROWS, CAST_LOGICAL_K = 4, 64
 
@@ -65,7 +219,6 @@ def _cast_golden(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {"out": decoded.to(torch.bfloat16)}
 
 
-# The pinned CPU simulator rounds fractional FP4 values during TCVT.
 @pytest.mark.skipif(not _HAS_TORCH_FP4, reason="torch.float4_e2m1fn_x2 required")
 @pytest.mark.platforms("a5")
 @st.cases(
@@ -94,13 +247,6 @@ def _cast_golden(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 )
 def test_fp4_cast_runtime(case_run):
     case_run.assert_passed()
-
-
-def _compare_packed_bytes(actual, expected):
-    """Compare every carrier byte, including distinct nibble encodings."""
-    assert actual.keys() == expected.keys()
-    for name in expected:
-        assert torch.equal(actual[name].view(torch.uint8), expected[name].view(torch.uint8)), name
 
 
 def _all_fp4_carriers() -> torch.Tensor:
@@ -316,4 +462,4 @@ def test_packed_fp4_raw_carrier_runtime(case_run):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--platform", "a5"])
+    pytest.main([__file__, "-v"])

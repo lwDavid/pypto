@@ -976,7 +976,7 @@ def reinterpret_view(
 ) -> Tensor | Tile:
     """Reinterpret the same bytes with a different dtype.
 
-    FP4E2M1X2 <-> UINT8/INT8 preserves the carrier shape. On A5, InCore
+    Either packed FP4 format <-> UINT8/INT8 preserves the carrier shape. On A5, InCore
     tensor and tile aliases require dense address-backed 2D row-major Vec
     storage, a static UB offset, and PYPTO or DSA_RP memory planning.
     Reshape the byte view separately; orchestration tensor aliases are unsupported.

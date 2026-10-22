@@ -3152,7 +3152,7 @@ def reinterpret_view(
 ) -> Call:
     """Reinterpret a tile over the same bytes with a different dtype.
 
-    FP4E2M1X2 <-> UINT8/INT8 is a same-shape byte alias for dense
+    Either packed FP4 format <-> UINT8/INT8 is a same-shape byte alias for dense
     address-backed 2D row-major Vec tiles with static UB offsets. Reshape
     the byte view separately. A5 codegen requires PYPTO / DSA_RP planning.
 
