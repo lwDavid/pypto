@@ -42,6 +42,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/packed_fp4_cast.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -1065,7 +1066,7 @@ class TileMemorySpaceMutator : public IRMutator {
     // Look up backend layout spec so tile.move carries the correct layout for the consumer.
     // This avoids a later ResolveBackendOpLayouts repair pass needing to insert tile.reshape.
     const backend::BackendTileLayoutSpec* layout_spec = nullptr;
-    if (backend::BackendConfig::IsConfigured()) {
+    if (backend::BackendConfig::IsConfigured() && !IsDensePackedFp4DnCast(call)) {
       layout_spec = backend::GetBackend()->GetTileLayoutSpec(call->op_->name_);
     }
 

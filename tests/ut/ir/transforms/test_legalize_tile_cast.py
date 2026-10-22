@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 import pytest
-from pypto import backend, ir, passes
+from pypto import DataType, backend, ir, passes
 from pypto.backend import BackendType
 from pypto.language.parser.diagnostics import InvalidOperationError
 
@@ -386,25 +386,6 @@ def test_packed_fp4_cast_rejects_unsupported_odd_rounding(dtype):
                 return pl.cast(value, dtype, mode="odd")
 
 
-@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
-@pytest.mark.parametrize("decode", [False, True])
-@pytest.mark.parametrize("tile_cast", [False, True])
-def test_packed_fp4_cast_requires_nd_storage(dtype, decode, tile_cast):
-    source_dtype = dtype if decode else pl.BF16
-    target_dtype = pl.BF16 if decode else dtype
-    span = ir.Span.unknown()
-    if tile_cast:
-        view = ir.TileView(blayout=ir.TileLayout.col_major)
-        source = ir.Var("source", ir.TileType([32, 64], source_dtype, None, view), span)
-        with pytest.raises(ValueError, match="requires row_major ND storage"):
-            ir.op.tile.cast(source, target_dtype)
-    else:
-        view = ir.TensorView([1, 32], ir.TensorLayout.DN)
-        source = ir.Var("source", ir.TensorType([32, 64], source_dtype, None, view), span)
-        with pytest.raises(ValueError, match="requires ND storage"):
-            ir.op.tensor.cast(source, target_dtype)
-
-
 def test_cast_to_packed_fp4_rejects_dynamic_last_dim():
     """Wider → FP4E2M1X2 requires a static positive even last dim."""
     n = pl.dynamic("N")
@@ -738,6 +719,148 @@ def test_legalized_chain_keeps_a_caller_supplied_tmp_on_the_final_hop():
     collector = _ArityCollector()
     collector.visit_program(after)
     assert collector.arities == [1, 2]
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("tile_cast", [False, True])
+def test_packed_fp4_cast_dn_scales_row_axis_and_preserves_layout(dtype, decode, tile_cast):
+    source_dtype = dtype if decode else pl.BF16
+    target_dtype = pl.BF16 if decode else dtype
+    span = ir.Span.unknown()
+    rows = 32 if decode else 64
+    expected_rows = 64 if decode else 32
+    shape = [ir.ConstInt(value, pl.INDEX, span) for value in (rows, 32)]
+    if tile_cast:
+        view = ir.TileView(blayout=ir.TileLayout.col_major)
+        source = ir.Var("source", ir.TileType(shape, source_dtype, None, view), span)
+        result = ir.op.tile.cast(source, target_dtype).type
+        assert isinstance(result, ir.TileType)
+        result_view = result.get_effective_tile_view()
+        assert result_view.blayout == ir.TileLayout.col_major
+    else:
+        stride = [ir.ConstInt(value, pl.INDEX, span) for value in (1, rows)]
+        tensor_view = ir.TensorView(stride, ir.TensorLayout.DN)
+        source = ir.Var("source", ir.TensorType(shape, source_dtype, None, tensor_view), span)
+        result = ir.op.tensor.cast(source, target_dtype).type
+        assert isinstance(result, ir.TensorType)
+        result_view = result.tensor_view
+        assert result_view is not None
+        assert result_view.layout == ir.TensorLayout.DN
+    for value, expected in zip(result.shape, (expected_rows, 32), strict=True):
+        assert isinstance(value, ir.ConstInt)
+        assert value.value == expected
+    for value, expected in zip(result_view.stride, (1, expected_rows), strict=True):
+        assert isinstance(value, ir.ConstInt)
+        assert value.value == expected
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+@pytest.mark.parametrize("valid", [[32, 32], [64, 16]])
+@pytest.mark.parametrize("tile_cast", [False, True])
+def test_packed_fp4_cast_dn_rejects_partial_or_padded_extent(dtype, valid, tile_cast):
+    span = ir.Span.unknown()
+    if tile_cast:
+        view = ir.TileView(valid_shape=valid, blayout=ir.TileLayout.col_major)
+        source = ir.Var("source", ir.TileType([64, 32], pl.BF16, None, view), span)
+        with pytest.raises(ValueError, match="requires a full static 2D valid shape"):
+            ir.op.tile.cast(source, dtype)
+    else:
+        view = ir.TensorView([1, 64], ir.TensorLayout.DN, valid_shape=valid)
+        source = ir.Var("source", ir.TensorType([64, 32], pl.BF16, None, view), span)
+        with pytest.raises(ValueError, match="requires a full static 2D valid shape"):
+            ir.op.tensor.cast(source, dtype)
+
+
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+def test_packed_fp4_cast_dn_rejects_strided_storage_and_wider_chains(dtype):
+    span = ir.Span.unknown()
+    strided = ir.TileView(stride=[1, 64], blayout=ir.TileLayout.col_major)
+    source = ir.Var("source", ir.TileType([32, 32], dtype, None, strided), span)
+    with pytest.raises(ValueError, match="requires canonical contiguous column-major strides"):
+        ir.op.tile.cast(source, pl.BF16)
+    dense = ir.TileView(blayout=ir.TileLayout.col_major)
+    source = ir.Var("source", ir.TileType([32, 32], dtype, None, dense), span)
+    with pytest.raises(ValueError, match="supports only BF16 and packed FP4 endpoints"):
+        ir.op.tile.cast(source, pl.FP32)
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP4E2M1X2, DataType.FP4E1M2X2])
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+def test_legalize_packed_dn_cast_preserves_loop_backedge(dtype, loop_kind):
+    """Already-packed DN casts keep their row-packed strides and carried storage."""
+    span = ir.Span.unknown()
+    source_view = ir.TileView(
+        valid_shape=[64, 4], stride=[1, 64], blayout=ir.TileLayout.col_major, start_offset=None
+    )
+    source_type = ir.TileType([64, 4], DataType.BF16, None, source_view, ir.MemorySpace.Vec)
+    source = ir.Var("source", source_type, span)
+    cast = ir.create_op_call("tile.cast", [source], {"target_type": dtype, "mode": 1}, span)
+    cast_type = cast.type
+    assert isinstance(cast_type, ir.TileType)
+    assert cast_type.tile_view is not None
+    assert [dim.value for dim in cast_type.shape if isinstance(dim, ir.ConstInt)] == [32, 4]
+    assert [dim.value for dim in cast_type.tile_view.stride if isinstance(dim, ir.ConstInt)] == [1, 32]
+
+    storage = ir.MemRef("carried_storage", span)
+    carry_type = ir.TileType([32, 4], dtype, storage, cast_type.tile_view, ir.MemorySpace.Vec)
+    seed = ir.Var("seed", cast_type, span)
+    argument = ir.IterArg("carried", carry_type, seed, span)
+    alias = ir.Var("alias", carry_type, span)
+    converted = ir.Var("converted", cast_type, span)
+    result = ir.Var("result", carry_type, span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(alias, argument, span),
+            ir.AssignStmt(converted, cast, span),
+            ir.YieldStmt([converted], span),
+        ],
+        span,
+    )
+    if loop_kind == "for":
+        loop = ir.ForStmt(
+            ir.Var("i", ir.ScalarType(DataType.INDEX), span),
+            ir.ConstInt(0, pl.INDEX, span),
+            ir.ConstInt(2, pl.INDEX, span),
+            ir.ConstInt(1, pl.INDEX, span),
+            [argument],
+            body,
+            [result],
+            span,
+        )
+    else:
+        loop = ir.WhileStmt(ir.ConstBool(False, span), [argument], body, [result], span)
+    program = ir.Program(
+        [
+            ir.Function(
+                "main",
+                [seed, source],
+                [carry_type],
+                ir.SeqStmts([loop, ir.ReturnStmt([result], span)], span),
+                span,
+                ir.FunctionType.Opaque,
+            )
+        ],
+        "packed_dn_loop",
+        span,
+    )
+    # Text loop headers cannot spell declaration-only carried storage; retain
+    # property verification and inspect storage/alias identity directly below.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        packed = _run(program, BackendType.Ascend950)
+    ir.assert_structural_equal(packed, program)
+    ir.verify_structural_bindings(packed)
+    function = next(iter(packed.functions.values()))
+    assert isinstance(function.body, ir.SeqStmts)
+    packed_loop = function.body.stmts[0]
+    assert isinstance(packed_loop, (ir.ForStmt, ir.WhileStmt))
+    binder = packed_loop.iter_args[0]
+    assert isinstance(binder.type, ir.TileType)
+    assert binder.type.memref is storage
+    assert isinstance(packed_loop.body, ir.SeqStmts)
+    binding = packed_loop.body.stmts[0]
+    assert isinstance(binding, ir.AssignStmt)
+    assert binding.value is binder
 
 
 if __name__ == "__main__":

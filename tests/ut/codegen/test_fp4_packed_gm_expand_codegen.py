@@ -637,5 +637,97 @@ def test_fp4_nz_assemble_rejects_automatic_mixed_expansion(dtype):
         _emit_incore_mlir(Program)
 
 
+def _dense_dn_fp4_conversion_program(source, target):
+    @pl.program
+    class ConvertDn:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            src: pl.Tensor[[64, 32], source, pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN)],
+            out: pl.Out[
+                pl.Tensor[[32, 32], target, pl.TensorView(stride=[1, 32], layout=pl.TensorLayout.DN)]
+            ],
+        ) -> pl.Tensor[[32, 32], target, pl.TensorView(stride=[1, 32], layout=pl.TensorLayout.DN)]:
+            # Nonzero GM offsets do not change the freshly loaded UB tile's
+            # zero origin. The packed-to-packed cast must retain DN through BF16.
+            packed = pl.tile.load(src, [32, 0], [32, 32])
+            return pl.tile.store(pl.cast(packed, target), [0, 0], out)
+
+    return ConvertDn
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+@pytest.mark.parametrize(("source", "target"), [(pl.fp4e2m1x2, pl.fp4e1m2x2), (pl.fp4e1m2x2, pl.fp4e2m1x2)])
+def test_dense_dn_fp4_cast_uses_static_valid_descriptors(source, target, planner):
+    mlir = _emit_incore_mlir(_dense_dn_fp4_conversion_program(source, target), planner)
+    casts = [line for line in mlir.splitlines() if "pto.tcvt " in line]
+    assert len(casts) == 2, mlir
+    for cast in casts:
+        assert "blayout=col_major" in cast, cast
+        assert "dtype=bf16, rows=64, cols=32, v_row=64, v_col=32" in cast, cast
+        assert "rows=32, cols=32, v_row=32, v_col=32" in cast, cast
+        assert "v_row=?" not in cast and "v_col=?" not in cast, cast
+    # Dynamic-valid DN TCVT faults on A5. Both packed operands must be given
+    # addressed static aliases because PTOAS cannot treshape custom FP4 types.
+    packed_views = [
+        line
+        for line in mlir.splitlines()
+        if "pto.alloc_tile" in line and "f4" in line and "v_row=32, v_col=32" in line
+    ]
+    assert len(packed_views) == 2, mlir
+    assert all("addr = " in line for line in packed_views), mlir
+    assert "pto.tmov " not in mlir and "pto.ttrans " not in mlir, mlir
+
+
+@pytest.mark.parametrize(("source", "target"), [(pl.fp4e2m1x2, pl.fp4e1m2x2), (pl.fp4e1m2x2, pl.fp4e2m1x2)])
+def test_dense_dn_fp4_cast_requires_addressed_planner(source, target):
+    with pytest.raises(ValueError, match="Packed FP4 DN cast requires static PYPTO or DSA_RP"):
+        _emit_incore_mlir(_dense_dn_fp4_conversion_program(source, target), passes.MemoryPlanner.PTOAS)
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+@pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+@pytest.mark.parametrize("direction", ["decode", "encode", "cross"])
+def test_dense_dn_tensor_cast_preserves_layout_through_default_pipeline(dtype, direction, planner):
+    source = pl.BF16 if direction == "encode" else dtype
+    other = pl.fp4e1m2x2 if dtype == pl.fp4e2m1x2 else pl.fp4e2m1x2
+    target = pl.BF16 if direction == "decode" else other if direction == "cross" else dtype
+    source_rows = 64 if source == pl.BF16 else 32
+    target_rows = 64 if target == pl.BF16 else 32
+
+    @pl.program
+    class TensorCastDn:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            src: pl.Tensor[
+                [source_rows, 32], source, pl.TensorView(stride=[1, source_rows], layout=pl.TensorLayout.DN)
+            ],
+            out: pl.Out[
+                pl.Tensor[
+                    [target_rows, 32],
+                    target,
+                    pl.TensorView(stride=[1, target_rows], layout=pl.TensorLayout.DN),
+                ]
+            ],
+        ) -> pl.Tensor[
+            [target_rows, 32], target, pl.TensorView(stride=[1, target_rows], layout=pl.TensorLayout.DN)
+        ]:
+            converted = pl.tensor.cast(src, target, mode="rint")
+            return pl.tensor.assemble(out, converted, [0, 0])
+
+    mlir = _emit_incore_mlir(TensorCastDn, planner)
+    assert mlir.count("pto.tload ") == mlir.count("pto.tstore ") == 1, mlir
+    casts = [line for line in mlir.splitlines() if "pto.tcvt " in line]
+    assert len(casts) == (2 if direction == "cross" else 1), mlir
+    for cast in casts:
+        assert cast.count("blayout=col_major") == 2, cast
+        assert "dtype=bf16, rows=64, cols=32, v_row=64, v_col=32" in cast, cast
+        assert "v_row=?" not in cast and "v_col=?" not in cast, cast
+    # Encoding loads the contiguous ND storage and flips only its metadata.
+    # Neither path is allowed to materialize a numerical transpose or move.
+    assert "pto.ttrans " not in mlir and "pto.tmov " not in mlir, mlir
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

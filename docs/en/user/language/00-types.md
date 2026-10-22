@@ -157,8 +157,10 @@ provably even dynamic `valid_shape` such as `2 * n`. Supported modes are
 encoding chains must preserve values through BF16; write an explicit BF16
 cast when intermediate rounding is intended.
 
-ND/DN carrier transfers and ND padding are supported. Numerical casts still
-require ND; DN casts and MXFP4 quantization are deferred.
+ND/DN carrier transfers and ND padding are supported. DN casts require full
+static dense 2D BF16/packed endpoints and PYPTO/DSA_RP static addresses;
+partial or boxed DN and wider DN cast chains are rejected. MXFP4 quantization
+is deferred.
 Ascend910/A2A3 execution remains unsupported for both formats. See
 [FP4](../../dev/fp4.md) for layout, alias, and memory-planner constraints.
 

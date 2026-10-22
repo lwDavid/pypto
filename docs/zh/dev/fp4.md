@@ -46,14 +46,14 @@ numerical results.
 
 ## Operator support on Ascend950
 
-Both formats support ND numerical casts and the byte-preserving transfers
-below. DN numerical casts and MXFP4 quantization are deferred.
+Both formats support ND casts, full static dense DN casts, and the transfers
+below. MXFP4 quantization is deferred.
 
 | Operation | Support |
 | --------- | ------- |
 | Packed GM views and load/store | Both formats, ND/DN carrier dimensions, strides, and offsets; a one-carrier width stays ND; PTOAS v0.67 handles DMA descriptor conversion |
 | Either packed format ↔ UINT8/INT8 alias | Same-shape, dense addressed 2D row-major Vec storage; PYPTO or DSA_RP planning |
-| Either packed format ↔ BF16 cast | Native TCVT on row-major, unboxed Vec; the last axis expands/contracts 2:1 |
+| Either packed format ↔ BF16 cast | Native TCVT on unboxed Vec; ND columns or full static dense DN rows expand/contract 2:1 |
 | Either packed format → FP8E4M3FN/FP8E5M2 cast | Legalized through BF16 and FP32, with a warning; a host reference or lookup table remains an alternative |
 | E2M1↔E1M2 conversion | Numerical cast through BF16; carrier shape is unchanged |
 | Other wider-type casts | Existing legalization with lossless intermediates; see the encoding constraint below |
@@ -61,7 +61,7 @@ below. DN numerical casts and MXFP4 quantization are deferred.
 | Packed Vec→Mat transfer | Matching layouts, explicit AIV function; generic InCore mixed-core expansion is rejected |
 | Native packed `extract` / `assemble` | Restricted layout-preserving cube/NZ paths with zero offset on the packed axis; use INT8 aliases for general Vec extraction and UINT8 aliases for ND insertion |
 | `fillpad`, `fillpad_expand`, `fillpad_inplace` | Both formats, ND Vec; zero/min/max padding preserves the valid carrier rectangle |
-| DN numerical casts | Deferred; transfer support does not enable column-major TCVT |
+| DN numerical casts | Full static dense 2D BF16↔packed or packed↔packed; PYPTO/DSA_RP static addresses; partial, padded, and boxed cases are rejected |
 | Direct packed `reshape` or `transpose` | Unsupported; reshape a byte alias where the existing alias contract permits it |
 | Native packed FP4 `matmul_mx` | Unsupported by the pinned PTOAS geometry contract; cast ND operands to FP8 first |
 | MXFP4 `quant_mx` | Deferred; `quant_mx` remains MXFP8-only |
@@ -80,11 +80,20 @@ rejected. Packing requires complete pairs: a positive even source extent or a
 provably even dynamic `valid_shape`, such as `2 * n`. Decoding expands the
 carrier extent without requiring it to be even.
 
-All packed casts require row-major `none_box` storage. Decoding through BF16 preserves every FP4 value exactly. Implicit encoding chains must also preserve
+All packed casts require `none_box` storage. Wider cast chains require ND.
+Decoding through BF16 preserves every FP4 value exactly. Implicit encoding chains must also preserve
 the original source through BF16: FP16/FP32 and larger integer sources are
 rejected because that intermediate can double-round. Write an explicit BF16
 cast first when that intermediate rounding is intended. The pinned simulator
 misrounds fractional FP4 conversions; numerical acceptance uses A5 hardware.
+
+DN casts require a full static 2D rectangle, canonical column-major strides,
+zero tile start offset, and BF16/packed endpoints. DN `[M,K]` carriers decode
+to BF16 `[2*M,K]`. Use `pl.tile.transpose_view` on a full ND BF16 tile to
+prepare a column-major BF16 source. Tensor casts preserve the same contract.
+PYPTO or DSA_RP must supply static tile addresses; codegen binds full static
+valid descriptors to select the safe native conversion path. Dynamic-valid
+DN descriptors can fault even for a full rectangle and remain unsupported.
 
 ## Decode a UINT8 carrier through a UB alias (Ascend950)
 

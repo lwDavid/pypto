@@ -461,5 +461,153 @@ def test_packed_fp4_raw_carrier_runtime(case_run):
     case_run.assert_passed()
 
 
+def _make_packed_fp4_dn_decode(dtype):
+    @pl.jit(auto_scope=False)
+    def decode(src: pl.Tensor[[4, 32], dtype], out: pl.Out[pl.Tensor[[4, 64], pl.BF16]]):
+        with pl.spmd(1):
+            block = pl.tile.get_block_idx()
+            source = pl.tensor.view(src, [32, 4], layout=pl.TensorLayout.DN)
+            target = pl.tensor.view(out, [64, 4], layout=pl.TensorLayout.DN)
+            packed = pl.tile.load(source, [block * 32, 0], [32, 4])
+            decoded = pl.cast(packed, pl.BF16)
+            pl.tile.store(decoded, [block * 64, 0], target)
+        return out
+
+    return decode
+
+
+def _make_packed_fp4_dn_encode(dtype, mode):
+    @pl.jit(auto_scope=False)
+    def encode(src: pl.Tensor[[4, 64], pl.BF16], out: pl.Out[pl.Tensor[[4, 32], dtype]]):
+        with pl.spmd(1):
+            block = pl.tile.get_block_idx()
+            # The metadata transpose gives TCVT a dense column-major source
+            # without depending on the ordinary BF16 DN load path.
+            values = pl.tile.load(src, [block * 4, 0], [4, 64])
+            column_values = pl.tile.transpose_view(values)
+            packed = pl.cast(column_values, dtype, mode=mode)
+            target = pl.tensor.view(out, [32, 4], layout=pl.TensorLayout.DN)
+            pl.tile.store(packed, [block * 32, 0], target)
+        return out
+
+    return encode
+
+
+def _make_packed_fp4_dn_convert(source_dtype, target_dtype):
+    @pl.jit(auto_scope=False)
+    def convert(src: pl.Tensor[[4, 32], source_dtype], out: pl.Out[pl.Tensor[[4, 32], target_dtype]]):
+        with pl.spmd(1):
+            block = pl.tile.get_block_idx()
+            source = pl.tensor.view(src, [32, 4], layout=pl.TensorLayout.DN)
+            target = pl.tensor.view(out, [32, 4], layout=pl.TensorLayout.DN)
+            packed = pl.tile.load(source, [block * 32, 0], [32, 4])
+            converted = pl.cast(packed, target_dtype, mode="rint")
+            pl.tile.store(converted, [block * 32, 0], target)
+        return out
+
+    return convert
+
+
+def _make_packed_fp4_dn_tensor_cast(source_dtype, target_dtype):
+    source_cols = 64 if source_dtype == pl.BF16 else 32
+    target_cols = 64 if target_dtype == pl.BF16 else 32
+
+    @pl.jit(auto_scope=False)
+    def convert(
+        src: pl.Tensor[[4, source_cols], source_dtype],
+        out: pl.Out[pl.Tensor[[4, target_cols], target_dtype]],
+    ):
+        with pl.spmd(1):
+            block = pl.tile.get_block_idx()
+            source = pl.tensor.view(src, [source_cols, 4], layout=pl.TensorLayout.DN)
+            target = pl.tensor.view(out, [target_cols, 4], layout=pl.TensorLayout.DN)
+            converted = pl.tensor.cast(source, target_dtype, mode="rint")
+            pl.tensor.assemble(target, converted, [block * target_cols, 0])
+        return out
+
+    return convert
+
+
+@pytest.mark.platforms("a5")
+@st.cases(
+    *[
+        st.case(
+            _make_packed_fp4_dn_decode(dtype),
+            tensors=[_packed_input(), _output(DataType.BF16, 64)],
+            name=f"{dtype}_dense_dn_decode_all_codes",
+            golden=_packed_decode_golden(dtype),
+            compare=_compare_bf16_bits,
+        )
+        for dtype in (pl.fp4e2m1x2, pl.fp4e1m2x2)
+    ],
+    *[
+        st.case(
+            _make_packed_fp4_dn_encode(dtype, mode),
+            tensors=[_encoding_input(dtype), _output(DataType.UINT8, 32)],
+            name=f"{dtype}_dense_dn_encode_{mode}",
+            golden=_packed_encode_golden(dtype, mode),
+            compare=_compare_packed_bytes,
+        )
+        for dtype in (pl.fp4e2m1x2, pl.fp4e1m2x2)
+        for mode in ("rint", "round", "floor", "ceil", "trunc")
+    ],
+    *[
+        st.case(
+            _make_packed_fp4_dn_convert(source, target),
+            tensors=[
+                _packed_input(0xBB if source == pl.fp4e2m1x2 else 0xFF),
+                _output(DataType.UINT8, 32),
+            ],
+            name=f"{source}_to_{target}_dense_dn_cast",
+            golden=_packed_conversion_golden(source, target),
+            compare=_compare_packed_bytes,
+        )
+        for source, target in ((pl.fp4e2m1x2, pl.fp4e1m2x2), (pl.fp4e1m2x2, pl.fp4e2m1x2))
+    ],
+)
+def test_packed_fp4_dense_dn_runtime(case_run):
+    case_run.assert_passed()
+
+
+@pytest.mark.platforms("a5")
+@st.cases(
+    *[
+        st.case(
+            _make_packed_fp4_dn_tensor_cast(dtype, pl.BF16),
+            tensors=[_packed_input(), _output(DataType.BF16, 64)],
+            name=f"{dtype}_dense_dn_tensor_decode",
+            golden=_packed_decode_golden(dtype),
+            compare=_compare_bf16_bits,
+        )
+        for dtype in (pl.fp4e2m1x2, pl.fp4e1m2x2)
+    ],
+    *[
+        st.case(
+            _make_packed_fp4_dn_tensor_cast(pl.BF16, dtype),
+            tensors=[_encoding_input(dtype), _output(DataType.UINT8, 32)],
+            name=f"{dtype}_dense_dn_tensor_encode",
+            golden=_packed_encode_golden(dtype, "rint"),
+            compare=_compare_packed_bytes,
+        )
+        for dtype in (pl.fp4e2m1x2, pl.fp4e1m2x2)
+    ],
+    *[
+        st.case(
+            _make_packed_fp4_dn_tensor_cast(source, target),
+            tensors=[
+                _packed_input(0xBB if source == pl.fp4e2m1x2 else 0xFF),
+                _output(DataType.UINT8, 32),
+            ],
+            name=f"{source}_to_{target}_dense_dn_tensor_cast",
+            golden=_packed_conversion_golden(source, target),
+            compare=_compare_packed_bytes,
+        )
+        for source, target in ((pl.fp4e2m1x2, pl.fp4e1m2x2), (pl.fp4e1m2x2, pl.fp4e2m1x2))
+    ],
+)
+def test_packed_fp4_dense_dn_tensor_runtime(case_run):
+    case_run.assert_passed()
+
+
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", "--platform", "a5"])

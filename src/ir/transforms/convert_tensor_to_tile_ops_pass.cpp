@@ -398,6 +398,17 @@ bool UsesDefaultTileInputs(const CallPtr& call) {
            IsOp(call, "tensor.gather_row"));
 }
 
+/// A dense BF16 DN -> packed FP4 cast needs a column-major Vec tile. Ordinary
+/// BF16 GM loads intentionally produce the default Vec layout, so this one
+/// consumer instead loads the identical ND storage and transposes its metadata.
+bool NeedsPackedFp4DnCastLoad(const CallPtr& call, size_t index) {
+  if (index != 0 || !IsOp(call, "tensor.cast") || call->args_.empty()) return false;
+  auto source = AsTensorTypeLike(call->args_[0]->GetType());
+  auto result = AsTensorTypeLike(call->GetType());
+  return source && result && source->dtype_ == DataType::BF16 && result->dtype_.IsPackedFp4() &&
+         source->tensor_view_.has_value() && source->tensor_view_->layout == TensorLayout::DN;
+}
+
 /**
  * @brief Visitor that collects tensor-typed variables used directly by converted ops.
  *
@@ -462,7 +473,7 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
       // Other args (e.g. matmul_acc's acc, which has no input_req) still need Phase-1 loads
       // so they reach the converter as TileType.
       for (size_t i = 0; i < call->args_.size(); ++i) {
-        if (conv_entry->input_reqs.count(i)) continue;
+        if (conv_entry->input_reqs.count(i) || NeedsPackedFp4DnCastLoad(call, i)) continue;
         const auto& arg = call->args_[i];
         // ``AsTensorTypeLike`` also collects ``DistributedTensorType`` params: inside
         // an InCore scope a window is this rank's local GM, so an op with no
@@ -1530,6 +1541,32 @@ class TensorToTileMutator : public TypePropagatingMutator {
       std::unordered_map<const Expr*, ExprPtr> loaded_args;
       for (size_t i = 0; i < args.size(); ++i) {
         if (input_reqs.count(i) || !AsTensorTypeLike(args[i]->GetType())) continue;
+        if (NeedsPackedFp4DnCastLoad(call, i)) {
+          auto source_type = AsTensorTypeLike(args[i]->GetType());
+          auto shape = source_type->shape_;
+          INTERNAL_CHECK_SPAN(shape.size() == 2, call->span_)
+              << "Internal error: dense packed FP4 DN cast must be two-dimensional";
+          std::swap(shape[0], shape[1]);
+          auto storage_view =
+              op_registry_.Create("tensor.view", {args[i], MakeShapeTuple(shape, call->span_)},
+                                  {{"layout", TensorLayout::ND}}, call->span_);
+          auto storage = std::make_shared<Var>("fp4_dn_storage", storage_view->GetType(), call->span_);
+          stmts.push_back(std::make_shared<AssignStmt>(storage, storage_view, call->span_));
+          auto extent = MakeShapeTuple(shape, call->span_);
+          std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
+          AppendCachePolicyKwarg(args[i], cache_policies_, &load_kwargs);
+          auto load =
+              op_registry_.Create("tile.load", {storage, MakeZeroOffsets(2, call->span_), extent, extent},
+                                  load_kwargs, call->span_);
+          auto loaded = std::make_shared<Var>("fp4_dn_loaded", load->GetType(), call->span_);
+          stmts.push_back(std::make_shared<AssignStmt>(loaded, load, call->span_));
+          RecordPackedTile(loaded, load);
+          auto transpose = op_registry_.Create("tile.transpose_view", {loaded}, {}, call->span_);
+          auto column_tile = std::make_shared<Var>("fp4_dn_values", transpose->GetType(), call->span_);
+          stmts.push_back(std::make_shared<AssignStmt>(column_tile, transpose, call->span_));
+          args[i] = std::move(column_tile);
+          continue;
+        }
         auto [it, inserted] = loaded_args.try_emplace(args[i].get());
         if (inserted) it->second = LoadTensorOperand(args[i], call->span_, stmts);
         args[i] = it->second;
