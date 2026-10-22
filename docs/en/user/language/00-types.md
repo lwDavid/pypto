@@ -149,11 +149,17 @@ because Torch has no matching native dtype. Unannotated UINT8 remains UINT8.
 Function calls reject E2M1/E1M2 format mismatches instead of reinterpreting
 one format as the other.
 
-This change establishes the two carrier types and preserves existing E2M1
-operator support. E1M2 numerical casts, additional transfer layouts, and MXFP4
-quantization are deferred. Ascend910/A2A3 execution remains unsupported for
-both packed formats. See [FP4](../../dev/fp4.md) for the existing E2M1 cast and
-alias paths and their layout restrictions.
+On Ascend950, both row-major packed formats convert to/from BF16: `[4,32]`
+carriers decode to `[4,64]` values. E2M1↔E1M2 conversion uses BF16 and keeps
+the carrier shape. Packing requires an even source extent, including a
+provably even dynamic `valid_shape` such as `2 * n`. Supported modes are
+`rint`, `round`, `floor`, `ceil`, and `trunc`; `odd` is rejected. Implicit
+encoding chains must preserve values through BF16; write an explicit BF16
+cast when intermediate rounding is intended.
+
+Additional transfer layouts, DN casts, and MXFP4 quantization are deferred.
+Ascend910/A2A3 execution remains unsupported for both formats. See
+[FP4](../../dev/fp4.md) for layout, alias, and memory-planner constraints.
 
 ### Annotating a scalar binding
 
@@ -277,9 +283,9 @@ rejected. Exception: FP8E8M0 `pl.tensor.view` may alias packed ND
 backing to `MX_A_ZZ` / `MX_B_NN` as a logical rank-2 view (`layout=mx_*`; PTOAS v0.60 packs
 physically). The matmul itself is `pl.matmul_mx` and its `_acc` /
 `_bias` variants, which take a data tile and a scale tile per operand. Both data tiles reaching
-the op must be `FP8E4M3FN`. The supported packed-input form is a left E2M1x2 operand multiplied by a
-right FP8 operand: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
-legalization pass expands that request to E2M1x2→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
+the op must be `FP8E4M3FN`. Either packed FP4 format may supply the left operand
+after conversion to FP8: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
+legalization pass expands that request to packed FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
 reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
 `group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
 task with `matmul_mx`; the generated data and scale cross directly over V2C, with a generated

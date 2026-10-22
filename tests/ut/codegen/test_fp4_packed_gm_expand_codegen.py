@@ -47,7 +47,7 @@ def _emit_incore_mlir(program, planner=passes.MemoryPlanner.PYPTO) -> str:
     return "\n".join(parts)
 
 
-def _uint8_ub_fp4_decode_program():
+def _uint8_ub_fp4_decode_program(dtype=pl.fp4e2m1x2):
     @pl.program
     class Decode:
         @pl.function(type=pl.FunctionType.InCore)
@@ -57,7 +57,7 @@ def _uint8_ub_fp4_decode_program():
             output: pl.Out[pl.Tensor[[96, 640], pl.BF16]],
         ) -> pl.Tensor[[96, 640], pl.BF16]:
             payload = pl.tile.load(packed, [32, 32], [32, 256])
-            fp4 = pl.reinterpret_view(payload, pl.FP4E2M1X2)
+            fp4 = pl.reinterpret_view(payload, dtype)
             decoded = pl.cast(fp4, pl.BF16)
             return pl.tile.store(decoded, [32, 64], output)
 
@@ -65,24 +65,25 @@ def _uint8_ub_fp4_decode_program():
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
-def test_uint8_ub_fp4_alias_is_consumed_by_native_cast_and_store(planner):
-    mlir = _emit_incore_mlir(_uint8_ub_fp4_decode_program(), planner)
+@pytest.mark.parametrize(("dtype", "pto_type"), [(pl.fp4e2m1x2, "f4E2M1x2"), (pl.fp4e1m2x2, "f4E1M2x2")])
+def test_uint8_ub_fp4_alias_is_consumed_by_native_cast_and_store(planner, dtype, pto_type):
+    mlir = _emit_incore_mlir(_uint8_ub_fp4_decode_program(dtype), planner)
     assert mlir.count("pto.tcvt ") == 1, mlir
     assert mlir.count("pto.tload ") == mlir.count("pto.tstore ") == 1, mlir
     cast = next(line for line in mlir.splitlines() if "pto.tcvt " in line)
-    assert "dtype=!pto.f4E2M1x2, rows=32, cols=256" in cast, cast
+    assert f"dtype=!pto.{pto_type}, rows=32, cols=256" in cast, cast
     assert "dtype=bf16, rows=32, cols=512" in cast, cast
     gm_views = [
         line for line in mlir.splitlines() if "pto.make_tensor_view" in line or "pto.partition_view" in line
     ]
-    assert gm_views and all("f4E2M1x2" not in line for line in gm_views), mlir
+    assert gm_views and all(pto_type not in line for line in gm_views), mlir
     assert not any(op in mlir for op in ("pto.tand", "pto.tshr", "pto.tshl", "pto.tscatter")), mlir
 
     assert "pto.treshape" not in mlir, mlir
     aliases = [
         line
         for line in mlir.splitlines()
-        if "pto.alloc_tile" in line and ("dtype=ui8" in line or "dtype=!pto.f4E2M1x2" in line)
+        if "pto.alloc_tile" in line and ("dtype=ui8" in line or f"dtype=!pto.{pto_type}" in line)
     ]
     assert len(aliases) == 2, mlir
     addresses = [match.group(1) for line in aliases if (match := re.search(r"addr = ([^, ]+)", line))]

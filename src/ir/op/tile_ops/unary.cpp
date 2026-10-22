@@ -173,17 +173,26 @@ TypePtr DeduceTileCastType(const std::vector<ExprPtr>& args,
       << " equals input dtype; same-dtype cast is not a valid operation. "
       << "Remove the cast or use a different target_type.";
 
-  // Packed FP4E2M1X2 ↔ a wider
-  // type is a 2:1 last-axis conversion (bf16[M,K] ↔ f4x2[M,K/2]): shape,
+  // Packed FP4 ↔ a wider type is a 2:1 last-axis conversion
+  // (bf16[M,K] ↔ f4x2[M,K/2]): shape,
   // valid_shape, and ND stride all follow that change.
   const Span& span = args[0]->span_;
-  auto shape = AdjustFp4E2M1x2CastLastDim(tile_type->shape_, tile_type->dtype_, target_dtype, span);
+  ValidatePackedFp4CastMode(target_dtype, GetRequiredKwarg<int>(kwargs, "mode", "cast"), span);
   const auto src_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  const bool packed_cast = tile_type->dtype_.IsPackedFp4() || target_dtype.IsPackedFp4();
+  // This path converts adjacent pairs along the final axis. Column-major
+  // storage needs a different packing axis and static-valid native descriptors.
+  CHECK_SPAN(!packed_cast || src_view.blayout == TileLayout::row_major, span)
+      << "cast involving packed FP4 requires row_major ND storage; DN casts are not supported here";
+  CHECK_SPAN(!packed_cast || src_view.slayout == TileLayout::none_box, span)
+      << "cast involving packed FP4 requires none_box storage; native FP4 TCVT does not convert boxed "
+         "layouts";
+  auto shape = AdjustPackedFp4CastLastDim(tile_type->shape_, tile_type->dtype_, target_dtype, span);
   TileView tile_view;
   tile_view.valid_shape =
-      AdjustFp4E2M1x2CastLastDim(GetValidShape(tile_type), tile_type->dtype_, target_dtype, span);
+      AdjustPackedFp4CastLastDim(GetValidShape(tile_type), tile_type->dtype_, target_dtype, span);
   tile_view.stride =
-      AdjustFp4E2M1x2CastStrides(src_view.stride, shape, tile_type->dtype_, target_dtype, span);
+      AdjustPackedFp4CastStrides(src_view.stride, shape, tile_type->dtype_, target_dtype, span);
   InheritTileViewLayout(tile_view, tile_type);
   return std::make_shared<TileType>(std::move(shape), target_dtype, std::nullopt, tile_view);
 }

@@ -1,7 +1,7 @@
 # Packed FP4 types in PyPTO
 
 PyPTO exposes two distinct packed FP4 data types. This page describes their
-shared type and byte-carrier ABI, followed by the existing E2M1 operator support.
+shared type and byte-carrier ABI, numerical casts, and current operator support.
 The short type table is in [Types](../user/language/00-types.md).
 
 ## Type and unit contract
@@ -25,7 +25,7 @@ preserve carrier geometry without doubling or halving a dimension.
 The two formats are distinct even when their shapes and byte sizes match.
 Changing a function annotation does not convert data: dependency calls,
 including void calls and submits, reject E2M1/E1M2 format mismatches.
-Numerical conversion between these formats is deferred to a later change.
+Use an explicit numerical `pl.cast` to convert between the formats.
 
 ## Torch and runtime carriers
 
@@ -44,30 +44,45 @@ rejects packed FP4 references instead of treating their bytes as FP32 values.
 Use a reference that explicitly decodes the selected format when checking
 numerical results.
 
-## Existing E2M1 operator support on Ascend950
+## Operator support on Ascend950
 
-The type foundation retains the existing `FP4E2M1X2` paths. It does not add
-E1M2 numerical casts, new transfer layouts, or MXFP4 quantization.
+Both formats support ND numerical casts. Additional transfer layouts, DN
+casts, and MXFP4 quantization are deferred.
 
-| Operation | Existing support |
-| --------- | ---------------- |
+| Operation | Support |
+| --------- | ------- |
 | Packed GM views | ND carrier dimensions and strides; PTOAS v0.67 handles DMA descriptor conversion |
-| E2M1x2 ↔ UINT8/INT8 alias | Same-shape, dense addressed 2D row-major Vec storage; PYPTO or DSA_RP planning |
-| E2M1x2 ↔ BF16 cast | Native TCVT; the last axis expands/contracts 2:1; packing requires a static positive even source extent |
-| E2M1x2 → FP8E4M3FN/FP8E5M2 cast | Legalized through BF16 and FP32, with a warning; a host reference or lookup table remains an alternative |
-| E1M2 numerical casts and E2M1↔E1M2 conversion | Deferred |
-| DN, NZ, column-major, column-vector `[M,1]`, or layout-changing packed views | Not enabled by this change |
+| Either packed format ↔ UINT8/INT8 alias | Same-shape, dense addressed 2D row-major Vec storage; PYPTO or DSA_RP planning |
+| Either packed format ↔ BF16 cast | Native TCVT on row-major, unboxed Vec; the last axis expands/contracts 2:1 |
+| Either packed format → FP8E4M3FN/FP8E5M2 cast | Legalized through BF16 and FP32, with a warning; a host reference or lookup table remains an alternative |
+| E2M1↔E1M2 conversion | Numerical cast through BF16; carrier shape is unchanged |
+| Other wider-type casts | Existing legalization with lossless intermediates; see the encoding constraint below |
+| DN, NZ, column-major, column-vector `[M,1]`, or layout-changing packed views | Additional transfer layouts and DN casts are deferred |
 | Direct packed `reshape` or `transpose` | Unsupported; reshape a byte alias where the existing alias contract permits it |
-| Native packed FP4 `matmul_mx` and MXFP4 `quant_mx` | Unsupported; the existing E2M1-to-FP8 cast can prepare an FP8 matrix operand |
+| Native packed FP4 `matmul_mx` | Unsupported by the pinned PTOAS geometry contract; cast ND operands to FP8 first |
+| MXFP4 `quant_mx` | Deferred; `quant_mx` remains MXFP8-only |
 | Ascend910/A2A3 packed FP4 execution | Unsupported |
 
 PTO GM views retain carrier coordinates. The conversion to the lower-level
 instruction's value geometry belongs to PTOAS; scaling the GM shape again in
 PyPTO would double its row pitch.
 
+## Numerical cast constraints
+
+BF16 encoding supports `rint`, `round`, `floor`, `ceil`, and `trunc`; `odd` is
+rejected. Packing requires complete pairs: a positive even source extent or a
+provably even dynamic `valid_shape`, such as `2 * n`. Decoding expands the
+carrier extent without requiring it to be even.
+
+All packed casts require row-major `none_box` storage. Decoding through BF16 preserves every FP4 value exactly. Implicit encoding chains must also preserve
+the original source through BF16: FP16/FP32 and larger integer sources are
+rejected because that intermediate can double-round. Write an explicit BF16
+cast first when that intermediate rounding is intended. The pinned simulator
+misrounds fractional FP4 conversions; numerical acceptance uses A5 hardware.
+
 ## Decode a UINT8 carrier through a UB alias (Ascend950)
 
-This existing E2M1 path keeps the GM tensor in UINT8 and aliases its UB storage:
+Keep the GM tensor in UINT8 and alias its UB storage with the encoded format:
 
 ```python
 import pypto.language as pl
@@ -88,7 +103,8 @@ def decode_bytes(
 ```
 
 The alias keeps the `[32,256]` carrier shape and the same 8,192-byte allocation.
-Only the numerical cast creates a fresh BF16 `[32,512]` tile.
+Only the numerical cast creates a fresh BF16 `[32,512]` tile. Use
+`pl.fp4e1m2x2` instead when the source bytes encode E1M2.
 
 The alias requires `slayout=none_box`, dense storage, zero tile `start_offset`,
 and an address-backed MemRef with a static UB byte offset. Its source byte span
@@ -101,8 +117,8 @@ orchestration tensor aliases remain unsupported.
 
 PYPTO and DSA_RP planning emit addressed aliases. PTOAS planning remains
 unsupported for this path because its `treshape` rejects the packed FP4 type.
-These existing alias constraints do not establish additional E1M2 operator
-support.
+Aliasing preserves bits; it does not numerically convert one FP4 format into
+the other.
 
 ## See also
 

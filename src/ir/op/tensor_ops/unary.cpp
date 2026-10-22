@@ -245,13 +245,18 @@ TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
                        "to match the pl.cast / tensor_ops.cast default.";
 
   const Span& span = args[0]->span_;
-  auto shape = AdjustFp4E2M1x2CastLastDim(tensor_type->shape_, tensor_type->dtype_, target_dtype, span);
+  ValidatePackedFp4CastMode(target_dtype, GetRequiredKwarg<int>(kwargs, "mode", "cast"), span);
+  const bool packed_cast = tensor_type->dtype_.IsPackedFp4() || target_dtype.IsPackedFp4();
+  const auto source_layout = tensor_type->tensor_view_.value_or(TensorView{}).layout;
+  CHECK_SPAN(!packed_cast || source_layout == TensorLayout::ND, span)
+      << "cast involving packed FP4 requires ND storage; DN and boxed casts are not supported here";
+  auto shape = AdjustPackedFp4CastLastDim(tensor_type->shape_, tensor_type->dtype_, target_dtype, span);
   auto valid_shape =
-      AdjustFp4E2M1x2CastLastDim(GetValidShape(tensor_type), tensor_type->dtype_, target_dtype, span);
+      AdjustPackedFp4CastLastDim(GetValidShape(tensor_type), tensor_type->dtype_, target_dtype, span);
   if (!IsFp4PackedCastGeometryChange(tensor_type->dtype_, target_dtype)) {
     return MakeFreshTensorType(std::move(shape), target_dtype, std::move(valid_shape));
   }
-  // Packed FP4E2M1X2 ↔ a wider type: last dim expands/contracts 2:1 and the
+  // Packed FP4 ↔ a wider type: last dim expands/contracts 2:1 and the
   // result is a fresh dense tensor whose strides are rebuilt from the destination
   // shape (not scaled from a possibly non-contiguous source pitch).
   TensorView view;
@@ -262,7 +267,7 @@ TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
     view.layout = tensor_type->tensor_view_->layout;
   }
   view.stride =
-      AdjustFp4E2M1x2CastStrides(std::move(src_stride), shape, tensor_type->dtype_, target_dtype, span);
+      AdjustPackedFp4CastStrides(std::move(src_stride), shape, tensor_type->dtype_, target_dtype, span);
   return std::make_shared<TensorType>(std::move(shape), target_dtype, std::nullopt,
                                       std::make_optional(std::move(view)));
 }
