@@ -158,9 +158,9 @@ encoding chains must preserve values through BF16; write an explicit BF16
 cast when intermediate rounding is intended.
 
 ND/DN carrier transfers and ND padding are supported. DN casts require full
-static dense 2D BF16/packed endpoints and PYPTO/DSA_RP static addresses;
-partial or boxed DN and wider DN cast chains are rejected. MXFP4 quantization
-is deferred.
+static dense 2D BF16/packed endpoints and PYPTO/DSA_RP static addresses.
+`pl.quant_mx(..., dtype=pl.fp4e2m1x2)` supports FP16/BF16 input; E1M2
+quantization and native packed FP4 matrix multiplication remain unsupported.
 Ascend910/A2A3 execution remains unsupported for both formats. See
 [FP4](../../dev/fp4.md) for layout, alias, and memory-planner constraints.
 
@@ -289,16 +289,21 @@ physically). The matmul itself is `pl.matmul_mx` and its `_acc` /
 the op must be `FP8E4M3FN`. Either packed FP4 format may supply the left operand
 after conversion to FP8: write `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`. On A5 the cast
 legalization pass expands that request to packed FP4→BF16→FP32→FP8E4M3FN. Native FP4×FP4 and the
-reverse FP8×FP4 form are not supported. Standalone `pl.quant_mx` (MXFP8-only in this release, with
-`group_axis` matching PTOAS `grpAxis`) is available. On Ascend950 it can share one InCore mixed
-task with `matmul_mx`; the generated data and scale cross directly over V2C, with a generated
-Vec-to-Mat-to-scale-memory path for the scale.
-`pl.quant_mx(tensor, group_axis=1)` returns GM A data `[M,K]` plus an
-`MX_A_ZZ[M,K/32]` scale tensor. `group_axis=0` accepts `[N,K]` and returns
-Cube-oriented data `[K,N]` plus `MX_B_NN[K/32,N]`. Those two tensor pairs are
-the required inputs to tensor `pl.matmul_mx`, which is 2-D-only and returns
-FP32; tensor MX accumulation, bias, transpose flags, batches, dynamic shapes,
-and FP4 are intentionally not part of this interface.
+reverse FP8×FP4 form are not supported. `pl.quant_mx` supports MXFP8 and native
+E2M1 MXFP4, with `group_axis` matching PTOAS `grpAxis`. FP8 results can feed `matmul_mx` in one mixed InCore task
+through V2C, including the generated Vec-to-Mat-to-scale-memory path.
+
+With the default FP8 dtype, tensor quantization returns `[M,K]` data and
+`MX_A_ZZ[M,K/32]` scales on axis1, or `[K,N]` data and `MX_B_NN[K/32,N]`
+scales for axis0 input `[N,K]`. Selecting `dtype=pl.fp4e2m1x2` halves the
+payload's final extent; scales are unchanged. FP4 requires FP16/BF16 input,
+full validity, `K%64==0`, axis1 `M%16==0`, and axis0 `N%64==0`.
+OCP is the default; NV FP16/BF16 is limited to axis0. E1M2 quantization is
+unsupported. PYPTO/DSA_RP static allocation is required for packed output.
+`pl.tile.quant_mx_raw` exposes raw UINT8 exponents and explicit workspaces.
+Only FP8 data/scale pairs feed tensor `pl.matmul_mx`, which is 2-D-only and
+returns FP32; tensor MX accumulation, bias, transpose flags, batches, dynamic
+shapes, and native packed FP4 matrix operands remain unsupported.
 
 ### Dynamic shapes
 

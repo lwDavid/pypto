@@ -47,7 +47,7 @@ numerical results.
 ## Operator support on Ascend950
 
 Both formats support ND casts, full static dense DN casts, and the transfers
-below. MXFP4 quantization is deferred.
+below. Native MXFP4 quantization supports E2M1 only.
 
 | Operation | Support |
 | --------- | ------- |
@@ -64,7 +64,8 @@ below. MXFP4 quantization is deferred.
 | DN numerical casts | Full static dense 2D BF16↔packed or packed↔packed; PYPTO/DSA_RP static addresses; partial, padded, and boxed cases are rejected |
 | Direct packed `reshape` or `transpose` | Unsupported; reshape a byte alias where the existing alias contract permits it |
 | Native packed FP4 `matmul_mx` | Unsupported by the pinned PTOAS geometry contract; cast ND operands to FP8 first |
-| MXFP4 `quant_mx` | Deferred; `quant_mx` remains MXFP8-only |
+| MXFP4 `quant_mx` | E2M1 only, FP16/BF16 source, OCP or supported axis0 NV; PYPTO/DSA_RP static allocation |
+| `pl.tile.quant_mx_raw` | Native E2M1 payload (INT8 for MXFP8) and raw UINT8 exponents with explicit workspaces; static partial validity and axis0 interleaving |
 | Ascend910/A2A3 packed FP4 execution | Unsupported |
 
 PTO GM views retain carrier coordinates. The conversion to the lower-level
@@ -138,6 +139,30 @@ the other.
 Partial-transfer hardware tests compare every carrier byte, including untouched
 output regions. The pinned simulator corrupts DN results, and its partial ND
 case crashes during cleanup despite matching bytes; these cases run on A5 only.
+
+## MX quantization
+
+`pl.quant_mx(..., dtype=pl.fp4e2m1x2)` quantizes FP16/BF16 in groups of 32
+values. Axis1 maps `[M,K]` to payload `[M,K/2]` and scales `[M,K/32]`;
+axis0 maps `[N,K]` to payload `[K,N/2]` and scales `[K/32,N]`. Payload shapes
+count byte carriers. Public quantization requires full valid tiles, `K%64==0`,
+axis1 `M%16==0`, and FP4 axis0 `N%64==0` for its 32-byte carrier stride.
+
+`quant_scale_alg="ocp"` is the default. `"nv"` supports the FP16/BF16 axis0
+path; axis1 FP16/BF16 NV and E1M2 quantization are unsupported by PTOAS.
+Packed quantization needs PYPTO or DSA_RP with static addresses because PTOAS
+cannot reshape its custom FP4 type into the required static-valid descriptor.
+
+`pl.tile.quant_mx_raw` keeps source orientation and returns native packed data
+plus UINT8 exponent codes without composite scale boxing. Workspaces use the
+source dtype. Axis0 workspaces retain the source physical column stride; axis1
+FP16/BF16 OCP scaling capacity rounds the group count up to 128 elements.
+Static partial valid regions are supported; axis1 requires tight physical/valid
+columns and FP4 physical columns divisible by 64. Axis0 groups 32 valid rows;
+`interleave=True` requires FP16/BF16 physical and valid rows divisible by 64.
+See the [operator catalog](../user/ops/01-catalog.md) for the quantization entry
+points. Native packed FP4 `matmul_mx` remains unsupported; the quantization
+result does not establish a native matrix path.
 
 ## See also
 

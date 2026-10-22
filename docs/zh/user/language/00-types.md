@@ -141,9 +141,9 @@ encoding chains must preserve values through BF16; write an explicit BF16
 cast when intermediate rounding is intended.
 
 ND/DN carrier transfers and ND padding are supported. DN casts require full
-static dense 2D BF16/packed endpoints and PYPTO/DSA_RP static addresses;
-partial or boxed DN and wider DN cast chains are rejected. MXFP4 quantization
-is deferred.
+static dense 2D BF16/packed endpoints and PYPTO/DSA_RP static addresses.
+`pl.quant_mx(..., dtype=pl.fp4e2m1x2)` supports FP16/BF16 input; E1M2
+quantization and native packed FP4 matrix multiplication remain unsupported.
 Ascend910/A2A3 execution remains unsupported for both formats. See
 [FP4](../../dev/fp4.md) for layout, alias, and memory-planner constraints.
 
@@ -217,13 +217,19 @@ view = pl.TensorView(stride=[1024, 1], layout=pl.TensorLayout.ND, valid_shape=[1
 
 只要给了 `stride`、`valid_shape`、`pad` 三者之一，`layout=` 就是必填的。`pl.TensorLayout` 是这些布局常量所属的枚举 —— `pl.ND` 就是 `pl.TensorLayout.ND`。
 
-剩下两个布局常量是 `pl.MX_A_ZZ` 与 `pl.MX_B_NN`。它们标注 Ascend950 上 MX（microscaling）操作数的 **GM scale 张量** —— `MX_A_ZZ` 对应左/A 侧 scale pack，`MX_B_NN` 对应右/B 侧 —— 使 Mat 到 scale 的 `pl.move` 能校验源布局，而不是把不兼容的数据按字节拷进 `LeftScale` / `RightScale`。这是唯一一处**要求**在 `pl.Tensor` 注解上写布局标记、而非不建议写的场景。MX 的 `pl.load` 可省略 `target_memory`；Python API 会选择 `pl.Mem.Mat`，`matmul_mx` 操作数放置会插入所需 move。常规 MX 子视图（`slice`、`reshape`、`transpose`、`reinterpret_view`）与 MX `remote_load` 会被拒绝。例外：FP8E8M0 的 `pl.tensor.view` 可在 packed ND backing 与 `MX_A_ZZ` / `MX_B_NN` 之间建立逻辑 rank-2 alias（`layout=mx_*`；PTOAS v0.60 负责物理打包）。矩阵乘本身是 `pl.matmul_mx` 及其 `_acc` / `_bias` 变体，每个操作数各接一块数据 tile 和一块 scale tile。进入算子的两块 data tile 必须都是 `FP8E4M3FN`。Either packed FP4 format may supply the lhs after an explicit `pl.cast(fp4_tile, pl.FP8E4M3FN)`; A5 legalizes it through BF16 and FP32 before `matmul_mx`. 原生 FP4×FP4 与反向 FP8×FP4 均不支持。独立 `pl.quant_mx`（本版本仅 MXFP8，以 `group_axis` 对齐 PTOAS `grpAxis`）已开放；在 Ascend950 上可与 `pl.matmul_mx` 共用一个 InCore mixed task，生成的 data 与 scale 直接经 V2C 传递，scale 会生成 Vec→Mat→scale memory 路径。
+剩下两个布局常量是 `pl.MX_A_ZZ` 与 `pl.MX_B_NN`。它们标注 Ascend950 上 MX（microscaling）操作数的 **GM scale 张量** —— `MX_A_ZZ` 对应左/A 侧 scale pack，`MX_B_NN` 对应右/B 侧 —— 使 Mat 到 scale 的 `pl.move` 能校验源布局，而不是把不兼容的数据按字节拷进 `LeftScale` / `RightScale`。这是唯一一处**要求**在 `pl.Tensor` 注解上写布局标记、而非不建议写的场景。MX 的 `pl.load` 可省略 `target_memory`；Python API 会选择 `pl.Mem.Mat`，`matmul_mx` 操作数放置会插入所需 move。常规 MX 子视图（`slice`、`reshape`、`transpose`、`reinterpret_view`）与 MX `remote_load` 会被拒绝。例外：FP8E8M0 的 `pl.tensor.view` 可在 packed ND backing 与 `MX_A_ZZ` / `MX_B_NN` 之间建立逻辑 rank-2 alias（`layout=mx_*`；PTOAS v0.60 负责物理打包）。矩阵乘本身是 `pl.matmul_mx` 及其 `_acc` / `_bias` 变体，每个操作数各接一块数据 tile 和一块 scale tile。进入算子的两块 data tile 必须都是 `FP8E4M3FN`。Either packed FP4 format may supply the lhs after an explicit `pl.cast(fp4_tile, pl.FP8E4M3FN)`; A5 legalizes it through BF16 and FP32 before `matmul_mx`. 原生 FP4×FP4 与反向 FP8×FP4 均不支持。`pl.quant_mx` supports MXFP8 and native E2M1 MXFP4, with `group_axis` matching PTOAS `grpAxis`. FP8 results can feed `matmul_mx` in one mixed InCore task through V2C, including the generated Vec-to-Mat-to-scale-memory path.
 
-`pl.quant_mx(tensor, group_axis=1)` 返回 GM A data `[M,K]` 和
-`MX_A_ZZ[M,K/32]` scale tensor。`group_axis=0` 接受 `[N,K]`，返回 Cube 定向的
-`[K,N]` data 和 `MX_B_NN[K/32,N]` scale。两组 tensor 是 tensor
-`pl.matmul_mx` 的必需输入；该接口仅支持 2-D 并返回 FP32，暂不包含 tensor MX
-累加、bias、transpose flag、batch、dynamic shape 或 FP4。
+With the default FP8 dtype, tensor quantization returns `[M,K]` data and
+`MX_A_ZZ[M,K/32]` scales on axis1, or `[K,N]` data and `MX_B_NN[K/32,N]`
+scales for axis0 input `[N,K]`. Selecting `dtype=pl.fp4e2m1x2` halves the
+payload's final extent; scales are unchanged. FP4 requires FP16/BF16 input,
+full validity, `K%64==0`, axis1 `M%16==0`, and axis0 `N%64==0`.
+OCP is the default; NV FP16/BF16 is limited to axis0. E1M2 quantization is
+unsupported. PYPTO/DSA_RP static allocation is required for packed output.
+`pl.tile.quant_mx_raw` exposes raw UINT8 exponents and explicit workspaces.
+Only FP8 data/scale pairs feed tensor `pl.matmul_mx`, which is 2-D-only and
+returns FP32; tensor MX accumulation, bias, transpose flags, batches, dynamic
+shapes, and native packed FP4 matrix operands remain unsupported.
 
 ### 动态 shape
 

@@ -1149,15 +1149,19 @@ def fillpad_expand(
 
 
 @overload
-def quant_mx(src: Tensor, *, group_axis: int, dtype: DataType = ...) -> tuple[Tensor, Tensor]: ...
+def quant_mx(
+    src: Tensor, *, group_axis: int, dtype: DataType = ..., quant_scale_alg: str = ...
+) -> tuple[Tensor, Tensor]: ...
 @overload
-def quant_mx(src: Tile, *, group_axis: int, dtype: DataType = ...) -> tuple[Tile, Tile]: ...
+def quant_mx(
+    src: Tile, *, group_axis: int, dtype: DataType = ..., quant_scale_alg: str = ...
+) -> tuple[Tile, Tile]: ...
 
 
 def quant_mx(
-    src: object, group_axis: int, dtype: DataType = DataType.FP8E4M3FN
+    src: object, group_axis: int, dtype: DataType = DataType.FP8E4M3FN, quant_scale_alg: str = "ocp"
 ) -> tuple[Tensor, Tensor] | tuple[Tile, Tile]:
-    """MXFP8 quantization, dispatched for GM tensors and tiles.
+    """MXFP8/MXFP4 quantization, dispatched for GM tensors and tiles.
 
     Tensor calls materialize data and correctly laid-out scale tensors in GM;
     tile calls retain the existing on-chip behavior. Both forms use
@@ -1165,9 +1169,9 @@ def quant_mx(
     input.
     """
     if isinstance(src, Tensor):
-        return _tensor.quant_mx(src, group_axis=group_axis, dtype=dtype)
+        return _tensor.quant_mx(src, group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg)
     if isinstance(src, Tile):
-        return _tile.quant_mx(src, group_axis=group_axis, dtype=dtype)
+        return _tile.quant_mx(src, group_axis=group_axis, dtype=dtype, quant_scale_alg=quant_scale_alg)
     _raise_type_dispatch_error("quant_mx", src)
 
 
